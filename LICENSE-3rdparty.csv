@@ -137,6 +137,7 @@ brotli-decompressor,https://github.com/dropbox/rust-brotli-decompressor,BSD-3-Cl
 bs58,https://github.com/Nullus157/bs58-rs,MIT OR Apache-2.0,The bs58 Authors
 bson,https://github.com/mongodb/bson-rust,MIT,"Y. T. Chung <zonyitoo@gmail.com>, Kevin Yeh <kevinyeah@utexas.edu>, Saghm Rossi <saghmrossi@gmail.com>, Patrick Freed <patrick.freed@mongodb.com>, Isabel Atkinson <isabel.atkinson@mongodb.com>, Abraham Egnor <abraham.egnor@mongodb.com>"
 bstr,https://github.com/BurntSushi/bstr,MIT OR Apache-2.0,Andrew Gallant <jamslam@gmail.com>
+btoi,https://github.com/niklasf/rust-btoi,MIT OR Apache-2.0,Niklas Fiekas <niklas.fiekas@backscattering.de>
 bumpalo,https://github.com/fitzgen/bumpalo,MIT OR Apache-2.0,Nick Fitzgerald <fitzgen@gmail.com>
 by_address,https://github.com/mbrubeck/by_address,MIT OR Apache-2.0,Matt Brubeck <mbrubeck@limpet.net>
 bytecheck,https://github.com/djkoloski/bytecheck,MIT,David Koloski <djkoloski@gmail.com>
@@ -432,6 +433,7 @@ jsonschema,https://github.com/Stranger6667/jsonschema,MIT,Dmitry Dygalo <dmitry@
 k8s-openapi,https://github.com/Arnavion/k8s-openapi,Apache-2.0,Arnav Singh <me@arnavion.dev>
 kasuari,https://github.com/ratatui/kasuari,MIT OR Apache-2.0,"Dylan Ede <dylanede@googlemail.com>, The Ratatui Developers"
 keccak,https://github.com/RustCrypto/sponges,Apache-2.0 OR MIT,RustCrypto Developers
+keyed_priority_queue,https://github.com/AngelicosPhosphoros/keyed_priority_queue,MIT,AngelicosPhosphoros <xuzin.timur@gmail.com>
 kqueue,https://gitlab.com/rust-kqueue/rust-kqueue,MIT,William Orr <will@worrbase.com>
 kqueue-sys,https://gitlab.com/rust-kqueue/rust-kqueue-sys,MIT,"William Orr <will@worrbase.com>, Daniel (dmilith) Dettlaff <dmilith@me.com>"
 krb5-src,https://github.com/MaterializeInc/rust-krb5-src,Apache-2.0,"Materialize, Inc."
@@ -507,6 +509,8 @@ multiversion,https://github.com/calebzulawski/multiversion,MIT OR Apache-2.0,Cal
 multiversion-macros,https://github.com/calebzulawski/multiversion,MIT OR Apache-2.0,Caleb Zulawski <caleb.zulawski@gmail.com>
 multiversion_no_op,https://github.com/hsivonen/multiversion_no_op,Apache-2.0 OR MIT,Henri Sivonen <hsivonen@hsivonen.fi>
 murmur3,https://github.com/stusmall/murmur3,MIT OR Apache-2.0,Stu Small <stuart.alan.small@gmail.com>
+mysql_async,https://github.com/blackbeam/mysql_async,MIT OR Apache-2.0,blackbeam <aikorsky@gmail.com>
+mysql_common,https://github.com/blackbeam/rust_mysql_common,MIT OR Apache-2.0,blackbeam <aikorsky@gmail.com>
 native-tls,https://github.com/rust-native-tls/rust-native-tls,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>
 ndk-context,https://github.com/rust-windowing/android-ndk-rs,MIT OR Apache-2.0,The Rust Windowing contributors
 newtype-uuid,https://github.com/oxidecomputer/newtype-uuid,MIT OR Apache-2.0,The newtype-uuid Authors
@@ -607,8 +611,12 @@ poly1305,https://github.com/RustCrypto/universal-hashes,Apache-2.0 OR MIT,RustCr
 portable-atomic,https://github.com/taiki-e/portable-atomic,Apache-2.0 OR MIT,The portable-atomic Authors
 portable-atomic-util,https://github.com/taiki-e/portable-atomic,Apache-2.0 OR MIT,The portable-atomic-util Authors
 postgres-openssl,https://github.com/rust-postgres/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>
+postgres-openssl,https://github.com/MaterializeInc/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>; Materialize, Inc.
 postgres-protocol,https://github.com/rust-postgres/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>
+postgres-protocol,https://github.com/MaterializeInc/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>; Materialize, Inc.
+postgres-replication,https://github.com/MaterializeInc/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>; Materialize, Inc.
 postgres-types,https://github.com/rust-postgres/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>
+postgres-types,https://github.com/MaterializeInc/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>; Materialize, Inc.
 powerfmt,https://github.com/jhpratt/powerfmt,MIT OR Apache-2.0,Jacob Pratt <jacob@jhpratt.dev>
 ppv-lite86,https://github.com/cryptocorrosion/cryptocorrosion,MIT OR Apache-2.0,The CryptoCorrosion Contributors
 prefix-trie,https://github.com/tiborschneider/prefix-trie,MIT OR Apache-2.0,The prefix-trie Authors
@@ -717,6 +725,7 @@ ryu,https://github.com/dtolnay/ryu,Apache-2.0 OR BSL-1.0,David Tolnay <dtolnay@g
 salsa20,https://github.com/RustCrypto/stream-ciphers,MIT OR Apache-2.0,RustCrypto Developers
 same-file,https://github.com/BurntSushi/same-file,Unlicense OR MIT,Andrew Gallant <jamslam@gmail.com>
 sasl2-sys,https://github.com/MaterializeInc/rust-sasl,Apache-2.0,"Materialize, Inc."
+saturating,https://github.com/breeswish/saturating-rs,MIT,Breezewish <me@breeswish.org>
 schannel,https://github.com/steffengy/schannel-rs,MIT,"Steven Fackler <sfackler@gmail.com>, Steffen Butzer <steffen.butzer@outlook.com>"
 schemars,https://github.com/GREsau/schemars,MIT,Graham Esau <gesau@hotmail.co.uk>
 scoped-tls,https://github.com/alexcrichton/scoped-tls,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
@@ -825,6 +834,7 @@ tokio-macros,https://github.com/tokio-rs/tokio,MIT,Tokio Contributors <team@toki
 tokio-native-tls,https://github.com/tokio-rs/tls,MIT,Tokio Contributors <team@tokio.rs>
 tokio-openssl,https://github.com/tokio-rs/tokio-openssl,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
 tokio-postgres,https://github.com/rust-postgres/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>
+tokio-postgres,https://github.com/MaterializeInc/rust-postgres,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>; Materialize, Inc.
 tokio-retry,https://github.com/srijs/rust-tokio-retry,MIT,Sam Rijs <srijs@airpost.net>
 tokio-rustls,https://github.com/rustls/tokio-rustls,MIT OR Apache-2.0,The tokio-rustls Authors
 tokio-stream,https://github.com/tokio-rs/tokio,MIT,Tokio Contributors <team@tokio.rs>
