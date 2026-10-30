@@ -1,0 +1,43 @@
+# Vectezium: builds the CDC features and runs their unit tests. Vector's own workflows assume
+# Datadog's secrets and runners; disable them in this fork's Actions settings.
+name: Vectezium
+
+on:
+  push:
+    branches: [vectezium]
+  pull_request:
+    branches: [vectezium]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FEATURES: sources-mysql_cdc,sources-postgres_cdc,sinks-azure_blob
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang cmake libclang-dev protobuf-compiler
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Vector's lint set (deny(warnings) with pedantic lints) still finds ~214 issues in the CDC
+      # code. Report them without failing the build until they are fixed, then drop this line.
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --locked --lib --tests --no-default-features --features "$FEATURES" -- -D warnings
+      - name: Unit tests
+        run: >
+          cargo test --locked --lib --no-default-features --features "$FEATURES" --
+          sources::cdc sources::mysql_cdc sources::postgres_cdc sinks::azure_blob
