@@ -463,6 +463,7 @@ lru = { version = "0.18.2", default-features = false }
 maxminddb = { version = "0.27.0", default-features = false, optional = true, features = ["simdutf8"] }
 md-5 = { version = "0.10", default-features = false, optional = true }
 mongodb = { version = "3.7.0", default-features = false, optional = true, features = ["compat-3-0-0", "dns-resolver", "rustls-tls"] }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "binlog", "native-tls-tls"], optional = true }
 async-nats = { version = "0.49.0", default-features = false, optional = true, features = ["ring", "websockets", "jetstream", "nkeys"] }
 nkeys = { version = "0.4.5", default-features = false, optional = true }
 nom = { workspace = true, optional = true }
@@ -731,6 +732,7 @@ sources-logs = [
   "sources-kubernetes_logs",
   "sources-logstash",
   "sources-mqtt",
+  "sources-mysql_cdc",
   "sources-nats",
   "sources-okta",
   "sources-opentelemetry",
@@ -805,7 +807,7 @@ sources-opentelemetry = [
   "sources-utils-http-headers",
   "sources-vector",
 ]
-sources-mysql_cdc = ["dep:base64", "dep:hex", "sinks-azure_blob"]
+sources-mysql_cdc = ["dep:mysql_async", "dep:base64", "dep:hex", "sinks-azure_blob"]
 sources-postgresql_metrics = ["dep:postgres-openssl", "dep:tokio-postgres"]
 sources-prometheus = ["sources-prometheus_scrape", "sources-prometheus_remote_write", "sources-prometheus_pushgateway"]
 sources-prometheus_scrape = ["sinks-prometheus", "sources-utils-http-client", "vector-lib/prometheus"]
