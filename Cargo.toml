@@ -805,6 +805,7 @@ sources-opentelemetry = [
   "sources-utils-http-headers",
   "sources-vector",
 ]
+sources-mysql_cdc = ["dep:base64", "dep:hex", "sinks-azure_blob"]
 sources-postgresql_metrics = ["dep:postgres-openssl", "dep:tokio-postgres"]
 sources-prometheus = ["sources-prometheus_scrape", "sources-prometheus_remote_write", "sources-prometheus_pushgateway"]
 sources-prometheus_scrape = ["sinks-prometheus", "sources-utils-http-client", "vector-lib/prometheus"]
