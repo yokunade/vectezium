@@ -1,0 +1,91 @@
+# Load-test pipeline used by run-load.sh: production-like settings against MySQL + Azurite.
+data_dir: ./out/load-data
+
+acknowledgements:
+  enabled: true
+
+sources:
+  mysql:
+    type: mysql_cdc
+    hostname: 127.0.0.1
+    port: 3306
+    user: vector_cdc
+    password: cdcpw
+    server_id: 5501
+    topic_prefix: load
+    database_include_list: ["loadtest"]
+    decimal_handling_mode: string
+    event_format: record
+    include_table_schemas: true
+    snapshot_batch_size: 20000
+    snapshot_max_threads: 4
+    snapshot_chunk_size: 250          # 1,000-row seed tables -> 4 chunks each
+    ssl_mode: disabled
+    heartbeat_interval_secs: 5
+
+sinks:
+  adls:
+    type: azure_blob
+    inputs: ["mysql"]
+    connection_string: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+    container_name: load
+    blob_prefix: "cdc/{{ metadata.db }}/{{ metadata.table }}/date=%Y-%m-%d/"
+    blob_append_uuid: true
+    blob_extension: json.gz
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: gzip
+    batch:
+      max_bytes: 20000000
+      timeout_secs: 10
+    # Like production: events are acknowledged once durably buffered on disk.
+    buffer:
+      type: disk
+      max_size: 2147483648
+      when_full: block
+    healthcheck:
+      enabled: false
+
+  # snapshot_completed (and any schema_change/truncate) events, under cdc/ so the verifier sees them.
+  control:
+    type: azure_blob
+    inputs: ["mysql.control"]
+    connection_string: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+    container_name: load
+    blob_prefix: "cdc/_control/date=%Y-%m-%d/"
+    blob_append_uuid: true
+    blob_extension: json.gz
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: gzip
+    batch:
+      timeout_secs: 5
+    healthcheck:
+      enabled: false
+
+  schemas:
+    type: azure_blob
+    inputs: ["mysql.table_schemas"]
+    connection_string: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+    container_name: load
+    blob_prefix: "_schemas/{{ db }}/{{ table }}/{{ schema_version }}"
+    blob_time_format: ""
+    blob_append_uuid: false
+    blob_overwrite: true              # re-emitted documents rewrite their own file
+    blob_extension: json
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: none
+    batch:
+      timeout_secs: 5
+    healthcheck:
+      enabled: false

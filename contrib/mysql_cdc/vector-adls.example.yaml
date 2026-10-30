@@ -1,0 +1,183 @@
+# Production-style pipeline: MySQL binlog -> change events -> an Azure storage account (Blob
+# Storage or ADLS Gen2), for example a data lake landing zone.
+#
+# One process replaces Debezium Server + its HTTP sink + a separate shipper. Offsets are only
+# stored after the events are durably handed off (end-to-end acknowledgements), so a crash or
+# restart never loses changes; it may replay the last few seconds (at-least-once).
+#
+# Storage layout (one folder per connector):
+#   cdc/prod-mysql/<db>/<table>/date=…/      row changes only: c, r, u, d — ordered by metadata.seq
+#   cdc/prod-mysql/_control/date=…/          schema_change, truncate, snapshot_completed
+#   cdc/prod-mysql/_schemas/<db>/<table>/<schema_version>.json
+#   cdc/prod-mysql/_offsets/latest.json      published commit point (+ _offsets/history/)
+#
+# Each row change is one line like:
+#   {"metadata": {"op": "u", "seq": "00000000000000009001.0000000000", "deleted": false, "snapshot": "false", "db": "inventory",
+#                 "table": "customers", "key": {"id": 1}, "commit_ts_ms": …, "gtid": "…:42",
+#                 "file": "mysql-bin.000003", "pos": 1543, "row": 0,
+#                 "schema_version": "338df4226391e36c", …},
+#    "record":   {"id": 1, "name": "Alicia", …}}
+# With record_images: before_and_after, `record` holds both images:
+#    "record":   {"before": {"id": 1, "name": "Alice", …}, "after": {"id": 1, "name": "Alicia", …}}
+data_dir: /var/lib/vector
+
+# Secrets are read from files: /run/secrets/vectezium/<name> (e.g. a Kubernetes or Container Apps
+# secret volume). Vector 0.60 does not expand ${ENV_VARS} in configs unless started with
+# --dangerously-allow-env-var-interpolation, so do not rely on that for passwords.
+secret:
+  files:
+    type: directory
+    path: /run/secrets/vectezium
+    remove_trailing_whitespace: true
+
+acknowledgements:
+  enabled: true
+
+sources:
+  mysql:
+    type: mysql_cdc
+    hostname: mysql.internal
+    port: 3306
+    user: vector_cdc
+    password: "SECRET[files.mysql_password]"
+    server_id: 184054                 # unique among all replicas of this server
+    topic_prefix: prod-mysql          # emitted as metadata.server_name
+    database_include_list: ["inventory", "billing"]
+    table_exclude_list: ["billing\\.tmp_.*"]
+    column_exclude_list: ["inventory\\.customers\\.(ssn|password_hash)"]
+    snapshot_mode: when_needed        # re-snapshot automatically if the binlog was purged
+    batch_size: 2048                  # events per downstream batch
+    decimal_handling_mode: string     # exact decimals that downstream tools can read
+    event_format: record              # metadata + record (use `debezium` for Debezium envelopes)
+    record_images: after              # or before_and_after to also keep the previous row image
+    include_table_schemas: true       # schema document per table version -> `mysql.table_schemas`
+    include_schema_changes: true
+    snapshot_strategy: incremental    # chunked snapshot while streaming: no long locks (needs GTIDs)
+    snapshot_new_tables: true         # snapshot tables added to the include lists later
+    publish_offsets: true             # publish the commit point to _offsets/
+    single_writer_lock:               # one instance at a time (redeploys, platform moves)
+      account_name: mystorage
+      auth:
+        azure_credential_kind: managed_identity
+      container_name: raw
+      blob_name: cdc/prod-mysql/_lock
+    offset_recovery:                  # data directory lost: resume from _offsets/latest.json
+      latest_blob: cdc/prod-mysql/_offsets/latest.json
+      folder: cdc/prod-mysql/
+    unplanned_snapshots: hold         # re-snapshots nobody asked for wait for an operator
+    ssl_mode: verify_identity
+    # ssl_ca_file: /etc/ssl/certs/DigiCertGlobalRootG2.crt.pem   # e.g. Azure Database for MySQL
+
+sinks:
+  # Every table's row changes (c, r, u, d), ordered by metadata.seq:
+  #   cdc/prod-mysql/<db>/<table>/date=YYYY-MM-DD/<uuid>.json.gz
+  rows:
+    type: azure_blob
+    inputs: ["mysql"]
+    account_name: mystorage           # the destination storage account (Blob Storage or ADLS Gen2)
+    auth:
+      azure_credential_kind: managed_identity
+    container_name: raw
+    blob_prefix: "cdc/prod-mysql/{{ metadata.db }}/{{ metadata.table }}/date=%Y-%m-%d/"
+    blob_append_uuid: true
+    blob_extension: json.gz
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]   # added by Vector; keep rows to metadata + record
+    framing:
+      method: newline_delimited
+    compression: gzip
+    batch:
+      max_bytes: 100000000            # ~100 MB per blob (uncompressed)
+      timeout_secs: 300               # data in storage is at most ~5 minutes old
+    # Survive restarts and ADLS outages without holding everything in memory.
+    buffer:
+      type: disk
+      max_size: 10737418240           # 10 GiB
+      when_full: block
+
+  # Connector events: schema_change, truncate, snapshot_completed (each with seq).
+  control:
+    type: azure_blob
+    inputs: ["mysql.control"]
+    account_name: mystorage           # the destination storage account (Blob Storage or ADLS Gen2)
+    auth:
+      azure_credential_kind: managed_identity
+    container_name: raw
+    blob_prefix: "cdc/prod-mysql/_control/date=%Y-%m-%d/"
+    blob_append_uuid: true
+    blob_extension: json.gz
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: gzip
+    batch:
+      timeout_secs: 10               # control events take part in checkpointing; keep this short
+
+  # One blob per table schema version (re-emitted documents overwrite themselves).
+  table_schemas:
+    type: azure_blob
+    inputs: ["mysql.table_schemas"]
+    account_name: mystorage           # the destination storage account (Blob Storage or ADLS Gen2)
+    auth:
+      azure_credential_kind: managed_identity
+    container_name: raw
+    blob_prefix: "cdc/prod-mysql/_schemas/{{ db }}/{{ table }}/{{ schema_version }}"
+    blob_time_format: ""
+    blob_append_uuid: false
+    blob_overwrite: true
+    blob_extension: json
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: none
+    batch:
+      timeout_secs: 10
+
+  # Published offsets: every event with seq <= the published seq is in storage, and every
+  # transaction it belongs to is complete. Append-only history (for Auto Loader) ...
+  offsets_history:
+    type: azure_blob
+    inputs: ["mysql.offsets"]
+    account_name: mystorage           # the destination storage account (Blob Storage or ADLS Gen2)
+    auth:
+      azure_credential_kind: managed_identity
+    container_name: raw
+    blob_prefix: "cdc/prod-mysql/_offsets/history/date=%Y-%m-%d/"
+    blob_append_uuid: true
+    blob_extension: json
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: none
+    batch:
+      timeout_secs: 10
+
+  # ... and the latest one, overwritten in place.
+  offsets_latest:
+    type: azure_blob
+    inputs: ["mysql.offsets"]
+    account_name: mystorage           # the destination storage account (Blob Storage or ADLS Gen2)
+    auth:
+      azure_credential_kind: managed_identity
+    container_name: raw
+    blob_prefix: "cdc/prod-mysql/_offsets/latest"
+    blob_time_format: ""
+    blob_append_uuid: false
+    blob_overwrite: true
+    blob_extension: json
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+    framing:
+      method: newline_delimited
+    compression: none
+    batch:
+      max_events: 1
+      timeout_secs: 1

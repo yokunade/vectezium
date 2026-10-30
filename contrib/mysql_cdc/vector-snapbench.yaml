@@ -1,0 +1,44 @@
+# Snapshot benchmark pipeline used by run-snapshot-bench.sh. Takes one snapshot and exits.
+data_dir: ./out/bench-data
+
+acknowledgements:
+  enabled: true
+
+sources:
+  mysql:
+    type: mysql_cdc
+    hostname: 127.0.0.1
+    port: 3306
+    user: vector_cdc
+    password: cdcpw
+    server_id: 5601
+    topic_prefix: bench
+    table_include_list: ["bench\\.t[0-9]+"]
+    snapshot_mode: initial_only        # Vector exits once the snapshot is delivered
+    snapshot_max_threads: @SNAP_THREADS@   # filled in by run-snapshot-bench.sh
+    snapshot_chunk_size: @SNAP_CHUNK@
+    snapshot_batch_size: 20000
+    decimal_handling_mode: string
+    event_format: record
+    ssl_mode: disabled
+
+sinks:
+  # Local gzip NDJSON, one file per table: measures the source and encoding, not network/storage.
+  files:
+    type: file
+    inputs: ["mysql"]
+    # Must be absolute (Vector confines templated paths); filled in by run-snapshot-bench.sh.
+    path: "@OUT_DIR@/{{ metadata.table }}.ndjson.gz"
+    compression: gzip
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
+
+  # snapshot_completed control events (one per table).
+  control:
+    type: file
+    inputs: ["mysql.control"]
+    path: "@OUT_DIR@/_control.ndjson"
+    encoding:
+      codec: json
+      except_fields: ["source_type", "timestamp"]
