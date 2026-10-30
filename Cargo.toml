@@ -737,8 +737,6 @@ sources-logs = [
   "sources-kubernetes_logs",
   "sources-logstash",
   "sources-mqtt",
-  "sources-mysql_cdc",
-  "sources-postgres_cdc",
   "sources-nats",
   "sources-okta",
   "sources-opentelemetry",
@@ -813,6 +811,8 @@ sources-opentelemetry = [
   "sources-utils-http-headers",
   "sources-vector",
 ]
+# The CDC sources are opt-in, not part of `sources-logs`, so default builds don't pull in
+# mysql_async or the git-pinned rust-postgres fork.
 sources-mysql_cdc = ["dep:mysql_async", "dep:base64", "dep:hex", "sinks-azure_blob"]
 sources-postgres_cdc = ["dep:pgrepl-tokio-postgres", "dep:pgrepl-openssl", "dep:postgres-replication", "dep:base64", "dep:hex", "sinks-azure_blob"]
 sources-postgresql_metrics = ["dep:postgres-openssl", "dep:tokio-postgres"]
