@@ -203,6 +203,24 @@ pub struct AzureBlobSinkConfig {
     ///   Set to `true` only if you intentionally want each flush to target a distinct append blob.
     pub blob_append_uuid: Option<bool>,
 
+    /// The file extension to use for blob names, without the leading dot.
+    ///
+    /// By default, the extension is derived from `compression` (`log`, `log.gz`, `log.zst`, …).
+    /// When set, this value is used instead, so for example `json.gz` or `ndjson` can be used for
+    /// newline-delimited JSON. The extension is used verbatim and does not change how data is
+    /// encoded or compressed.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "json.gz", docs::examples = "ndjson"))]
+    pub blob_extension: Option<String>,
+
+    /// Replace a block blob that already exists under the same name.
+    ///
+    /// By default an upload never overwrites an existing blob (the request fails with
+    /// `409 Conflict`). Enabling this is useful when blob names are deterministic and a rewrite
+    /// is idempotent, for example one file per schema version. Ignored for append blobs.
+    #[serde(default)]
+    pub blob_overwrite: bool,
+
     /// The type of blob to use when writing to Azure Blob Storage.
     ///
     /// - `block` (default): each batch creates a new uniquely-named blob.
@@ -324,6 +342,8 @@ impl GenerateConfig for AzureBlobSinkConfig {
             blob_prefix: default_blob_prefix(),
             blob_time_format: Some(String::from("%s")),
             blob_append_uuid: Some(true),
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Block,
             encoding: (Some(NewlineDelimitedEncoderConfig::new()), JsonSerializerConfig::default()).into(),
             compression: Compression::gzip_default(),
@@ -503,6 +523,16 @@ impl ValidatedSink for AzureBlobSinkConfig {
 
         let confined_blob_prefix = self.confined_blob_prefix()?;
 
+        if let Some(extension) = &self.blob_extension
+            && (extension.is_empty() || extension.starts_with('.') || extension.contains('/'))
+        {
+            return Err(format!(
+                "invalid `blob_extension` {extension:?}: it must be non-empty, without a leading \
+                 dot, and must not contain '/'"
+            )
+            .into());
+        }
+
         Ok(ValidatedAzureBlob {
             parsed_connection_string,
             container_url,
@@ -573,6 +603,8 @@ impl AzureBlobSinkConfig {
             container_name: self.container_name.clone(),
             blob_time_format: validated.blob_time_format.clone(),
             blob_append_uuid: validated.blob_append_uuid,
+            blob_extension: self.blob_extension.clone(),
+            blob_overwrite: self.blob_overwrite,
             blob_type: self.blob_type,
             encoder: (self.encoding.transformer(), encoder),
             compression: self.compression,
@@ -702,6 +734,8 @@ mod tests {
             blob_prefix: "blob".try_into().unwrap(),
             blob_time_format: None,
             blob_append_uuid: None,
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Block,
             encoding: (
                 Some(NewlineDelimitedEncoderConfig::new()),
@@ -773,6 +807,8 @@ mod tests {
             blob_prefix: "blob".try_into().unwrap(),
             blob_time_format: None,
             blob_append_uuid: None,
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Block,
             encoding: (
                 Some(NewlineDelimitedEncoderConfig::new()),
@@ -840,6 +876,8 @@ mod tests {
             blob_prefix: "blob".try_into().unwrap(),
             blob_time_format: None,
             blob_append_uuid: None,
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Block,
             encoding: (
                 Some(NewlineDelimitedEncoderConfig::new()),
@@ -959,6 +997,8 @@ pub struct AzureBlobRequest {
     pub blob_metadata: Option<std::collections::HashMap<String, String>>,
     /// Whether the request should write to a block or append blob.
     pub blob_type: AzureBlobType,
+    /// Replace an existing block blob instead of failing with `409 Conflict`.
+    pub overwrite: bool,
 }
 
 impl Finalizable for AzureBlobRequest {

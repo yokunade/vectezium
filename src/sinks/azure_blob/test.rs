@@ -42,6 +42,8 @@ fn default_config(encoding: EncodingConfigWithFraming) -> AzureBlobSinkConfig {
         blob_prefix: Template::default(),
         blob_time_format: None,
         blob_append_uuid: None,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::default(),
         encoding,
         compression: Compression::gzip_default(),
@@ -83,6 +85,8 @@ fn azure_blob_build_request_without_compression() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -134,6 +138,8 @@ fn azure_blob_build_request_with_compression() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -163,6 +169,60 @@ fn azure_blob_build_request_with_compression() {
 }
 
 #[test]
+fn azure_blob_build_request_with_compression_with_custom_extension() {
+    let log = Event::Log(LogEvent::from("test message"));
+    let compression = Compression::gzip_default();
+    let container_name = String::from("logs");
+    let sink_config = AzureBlobSinkConfig {
+        blob_prefix: "blob".try_into().unwrap(),
+        container_name: container_name.clone(),
+        ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
+    };
+    let blob_time_format = String::new();
+    let blob_append_uuid = false;
+
+    let key = sink_config
+        .key_partitioner()
+        .unwrap()
+        .partition(&log)
+        .expect("key wasn't provided");
+
+    let request_options = AzureBlobRequestOptions {
+        container_name,
+        blob_time_format,
+        blob_append_uuid,
+        blob_extension: Some("json.gz".to_string()),
+        blob_overwrite: false,
+        blob_type: AzureBlobType::Block,
+        encoder: (
+            Transformer::default(),
+            Encoder::<Framer>::new(
+                NewlineDelimitedEncoder::default().into(),
+                TextSerializerConfig::default().build().into(),
+            ),
+        ),
+        compression,
+        tags: None,
+        metadata: None,
+    };
+
+    let mut byte_size = GroupedCountByteSize::new_untagged();
+    byte_size.add_event(&log, log.estimated_json_encoded_size_of());
+
+    let (metadata, request_metadata_builder, _events) =
+        request_options.split_input((key, vec![log]));
+
+    let payload = EncodeResult::uncompressed(Bytes::new(), byte_size);
+    let request_metadata = request_metadata_builder.build(&payload);
+    let request = request_options.build_request(metadata, request_metadata, payload);
+
+    assert_eq!(request.metadata.partition_key, "blob.json.gz".to_string());
+    assert!(!request.overwrite, "uploads never overwrite unless enabled");
+    assert_eq!(request.content_encoding, Some("gzip"));
+    assert_eq!(request.content_type, "text/plain");
+}
+
+#[test]
 fn azure_blob_build_request_with_time_format() {
     let log = Event::Log(LogEvent::from("test message"));
     let compression = Compression::None;
@@ -185,6 +245,8 @@ fn azure_blob_build_request_with_time_format() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -239,6 +301,8 @@ fn azure_blob_build_request_with_uuid() {
         container_name,
         blob_time_format,
         blob_append_uuid,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -575,6 +639,8 @@ fn azure_blob_build_request_with_blob_tags() {
         container_name,
         blob_time_format: String::new(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -632,6 +698,8 @@ fn azure_blob_build_request_with_blob_metadata() {
         container_name,
         blob_time_format: String::new(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -683,6 +751,8 @@ fn azure_blob_build_request_with_empty_blob_tags_and_metadata() {
         container_name,
         blob_time_format: String::new(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -730,6 +800,8 @@ fn azure_blob_build_request_append_blob_defaults() {
         container_name,
         blob_time_format: "%Y-%m-%dT%H".to_string(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1001,6 +1073,8 @@ fn azure_blob_append_blob_naming_defaults_are_hourly() {
         blob_type: AzureBlobType::Append,
         blob_time_format: None,
         blob_append_uuid: None,
+        blob_extension: None,
+        blob_overwrite: false,
         ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
     };
 
@@ -1017,6 +1091,8 @@ fn azure_blob_block_blob_naming_defaults_unchanged() {
         blob_type: AzureBlobType::Block,
         blob_time_format: None,
         blob_append_uuid: None,
+        blob_extension: None,
+        blob_overwrite: false,
         ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
     };
 
@@ -1047,6 +1123,8 @@ fn azure_blob_build_request_append_blob_with_compression() {
         container_name,
         blob_time_format: String::new(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1131,6 +1209,8 @@ fn azure_blob_block_blob_request_carries_block_type() {
         container_name,
         blob_time_format: String::new(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -1179,6 +1259,8 @@ fn azure_blob_append_blob_with_uuid_override_generates_unique_keys() {
             container_name: container_name.clone(),
             blob_time_format: String::new(),
             blob_append_uuid: true, // explicit override: UUID even for append type
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Append,
             encoder: (
                 Transformer::default(),
@@ -1236,6 +1318,8 @@ fn azure_blob_append_blob_stable_name_without_uuid_and_time() {
             container_name: container_name.clone(),
             blob_time_format: String::new(), // no time component
             blob_append_uuid: false,         // no UUID
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Append,
             encoder: (
                 Transformer::default(),
@@ -1298,6 +1382,8 @@ fn azure_blob_append_blob_compression_change_rotates_blob_name() {
             container_name: container_name.clone(),
             blob_time_format: String::new(),
             blob_append_uuid: false,
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Append,
             encoder: (
                 Transformer::default(),
@@ -1374,6 +1460,8 @@ fn azure_blob_append_blob_custom_time_format_hourly_rotation() {
         container_name,
         blob_time_format: "%Y-%m-%d-%H".to_string(), // hourly rotation
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1676,6 +1764,8 @@ fn azure_blob_build_request_append_blob_with_tags_and_metadata() {
         container_name,
         blob_time_format: String::new(),
         blob_append_uuid: false,
+        blob_extension: None,
+        blob_overwrite: false,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1703,4 +1793,26 @@ fn azure_blob_build_request_append_blob_with_tags_and_metadata() {
     assert_eq!(request.tags, Some("Project=Blue".to_string()));
     assert_eq!(request.blob_metadata, Some(metadata));
     assert_eq!(request.blob_type, AzureBlobType::Append);
+}
+
+#[test]
+fn validates_blob_extension() {
+    let config_with = |extension: &str| -> AzureBlobSinkConfig {
+        toml::from_str(&format!(
+            r#"
+                connection_string = "AccountName=mylogstorage"
+                container_name = "my-logs"
+                blob_extension = "{extension}"
+                encoding.codec = "json"
+            "#
+        ))
+        .unwrap()
+    };
+    assert!(crate::config::ValidatedSink::validate(&config_with("json.gz")).is_ok());
+    for bad in ["", ".json", "a/b"] {
+        assert!(
+            crate::config::ValidatedSink::validate(&config_with(bad)).is_err(),
+            "{bad:?} should be rejected"
+        );
+    }
 }

@@ -56,6 +56,7 @@ impl Service<AzureBlobRequest> for AzureBlobService {
                 AzureBlobType::Block => {
                     upload_block_blob(
                         &blob_client,
+                        request.overwrite,
                         request.blob_data,
                         request.content_type,
                         request.content_encoding,
@@ -89,6 +90,7 @@ impl Service<AzureBlobRequest> for AzureBlobService {
 
 async fn upload_block_blob(
     blob_client: &BlobClient,
+    overwrite: bool,
     data: Bytes,
     content_type: &'static str,
     content_encoding: Option<&'static str>,
@@ -101,8 +103,13 @@ async fn upload_block_blob(
         blob_tags_string: tags,
         metadata: blob_metadata,
         ..Default::default()
-    }
-    .if_not_exists();
+    };
+    // Unless overwriting is enabled, never replace an existing blob.
+    let upload_options = if overwrite {
+        upload_options
+    } else {
+        upload_options.if_not_exists()
+    };
 
     blob_client
         .upload(RequestContent::from(data.to_vec()), Some(upload_options))

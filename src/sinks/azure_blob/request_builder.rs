@@ -23,6 +23,10 @@ pub struct AzureBlobRequestOptions {
     pub container_name: String,
     pub blob_time_format: String,
     pub blob_append_uuid: bool,
+    /// Overrides the compression-derived extension when set.
+    pub blob_extension: Option<String>,
+    /// Replace existing block blobs instead of failing.
+    pub blob_overwrite: bool,
     pub blob_type: AzureBlobType,
     pub encoder: (Transformer, Encoder<Framer>),
     pub compression: Compression,
@@ -76,7 +80,10 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
             formatted_ts.to_string()
         };
 
-        let extension = self.compression.extension();
+        let extension = self
+            .blob_extension
+            .as_deref()
+            .unwrap_or_else(|| self.compression.extension());
         azure_metadata.partition_key =
             format!("{}{blob_name}.{extension}", azure_metadata.partition_key);
 
@@ -107,6 +114,7 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
                 .map(encode_tags),
             blob_metadata: self.metadata.as_ref().filter(|m| !m.is_empty()).cloned(),
             blob_type: self.blob_type,
+            overwrite: self.blob_overwrite,
         }
     }
 }

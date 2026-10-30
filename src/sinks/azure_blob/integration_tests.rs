@@ -248,6 +248,8 @@ async fn assert_rotate_files_after_the_buffer_size_is_reached(mut config: AzureB
     let config = AzureBlobSinkConfig {
         blob_prefix: (blob_prefix.clone() + "{{key}}").try_into().unwrap(),
         blob_append_uuid: Some(false),
+        blob_extension: None,
+        blob_overwrite: false,
         batch: config.batch,
         ..config
     };
@@ -336,6 +338,8 @@ async fn assert_append_blob_reuses_same_blob(config: AzureBlobSinkConfig) {
         blob_type: AzureBlobType::Append,
         blob_time_format: Some(String::new()), // stable name — no time component
         blob_append_uuid: Some(false),
+        blob_extension: None,
+        blob_overwrite: false,
         ..config
     };
 
@@ -373,6 +377,8 @@ async fn assert_append_blob_json_encoding(config: AzureBlobSinkConfig) {
         blob_type: AzureBlobType::Append,
         blob_time_format: Some(String::new()),
         blob_append_uuid: Some(false),
+        blob_extension: None,
+        blob_overwrite: false,
         encoding: (
             Some(NewlineDelimitedEncoderConfig::new()),
             JsonSerializerConfig::default(),
@@ -419,6 +425,8 @@ async fn assert_append_blob_json_default_framing(config: AzureBlobSinkConfig) {
         blob_type: AzureBlobType::Append,
         blob_time_format: Some(String::new()),
         blob_append_uuid: Some(false),
+        blob_extension: None,
+        blob_overwrite: false,
         // Deliberately no framing: this is the config that array-framed each batch.
         encoding: (None::<FramingConfig>, JsonSerializerConfig::default()).into(),
         ..config
@@ -468,6 +476,8 @@ async fn assert_append_blob_default_hourly_rotation(config: AzureBlobSinkConfig)
         // to exercise the type-aware defaults in build_processor.
         blob_time_format: None,
         blob_append_uuid: None,
+        blob_extension: None,
+        blob_overwrite: false,
         ..config
     };
 
@@ -547,6 +557,8 @@ async fn assert_append_blob_multiple_forced_flushes(config: AzureBlobSinkConfig)
         blob_type: AzureBlobType::Append,
         blob_time_format: Some(String::new()),
         blob_append_uuid: Some(false),
+        blob_extension: None,
+        blob_overwrite: false,
         batch,
         ..config
     };
@@ -592,6 +604,8 @@ async fn assert_append_blob_with_tags_and_metadata(config: AzureBlobSinkConfig) 
         blob_type: AzureBlobType::Append,
         blob_time_format: Some(String::new()),
         blob_append_uuid: Some(false),
+        blob_extension: None,
+        blob_overwrite: false,
         tags: Some(tags.clone()),
         metadata: Some(metadata.clone()),
         ..config
@@ -638,6 +652,8 @@ impl AzureBlobSinkConfig {
             blob_prefix: Template::default(),
             blob_time_format: None,
             blob_append_uuid: None,
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Block,
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -666,6 +682,8 @@ impl AzureBlobSinkConfig {
             blob_prefix: Template::default(),
             blob_time_format: None,
             blob_append_uuid: None,
+            blob_extension: None,
+            blob_overwrite: false,
             blob_type: AzureBlobType::Block,
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
