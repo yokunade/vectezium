@@ -60,6 +60,14 @@ pub trait CdcOffset:
     /// Adds the connector's position fields to a published offset (for example `gtid_set`,
     /// `file`, `pos` for MySQL; `lsn` for PostgreSQL).
     fn publish_position(&self, payload: &mut Map<String, Json>);
+
+    /// Whether this offset should be published although its `seq` equals that of `published`:
+    /// its log position moved on while no captured changes flowed. A connector whose server
+    /// keeps log until offsets are published (a PostgreSQL slot with `publish_offsets`) needs
+    /// this so an idle source keeps releasing log.
+    fn advances_without_seq(&self, _published: &Self) -> bool {
+        false
+    }
 }
 
 /// Durable, crash-safe storage of the latest acknowledged offset.
@@ -169,9 +177,26 @@ impl<O: CdcOffset> Checkpoints<O> {
         guard: WriterGuard,
         written: tokio::sync::oneshot::Sender<()>,
     ) -> Self {
+        Self::start_notifying(acknowledgements, store, poisoned, publisher, guard, written, None)
+    }
+
+    /// Like [`Self::start`], and also reports on `stored` every offset the source may forget
+    /// the log before: each stored offset, or with `publish_offsets` each published one (a
+    /// source that lost its data directory resumes from the published offset). A connector whose
+    /// server keeps its log for it (a PostgreSQL replication slot) lets the server discard log
+    /// only up to these offsets.
+    pub fn start_notifying(
+        acknowledgements: bool,
+        store: CheckpointStore<O>,
+        poisoned: Arc<AtomicBool>,
+        publisher: Option<OffsetPublisher>,
+        guard: WriterGuard,
+        written: tokio::sync::oneshot::Sender<()>,
+        stored: Option<tokio::sync::watch::Sender<Option<O>>>,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<O>();
         crate::spawn_in_current_span(async move {
-            checkpoint_writer(rx, store, publisher, guard).await;
+            checkpoint_writer(rx, store, publisher, guard, stored).await;
             _ = written.send(());
         });
 
@@ -273,10 +298,17 @@ async fn checkpoint_writer<O: CdcOffset>(
     store: CheckpointStore<O>,
     mut publisher: Option<OffsetPublisher>,
     guard: WriterGuard,
+    stored_tx: Option<tokio::sync::watch::Sender<Option<O>>>,
 ) {
+    let notify = |offset: &O| {
+        if let Some(tx) = &stored_tx {
+            tx.send_replace(Some(offset.clone()));
+        }
+    };
     let mut latest: Option<O> = None;
     let mut stored: Option<O> = None;
     let mut published_seq = (0, 0);
+    let mut published: Option<O> = None;
     let mut last_published: Option<Instant> = None;
     let mut tick = tokio::time::interval(CHECKPOINT_WRITE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -294,6 +326,9 @@ async fn checkpoint_writer<O: CdcOffset>(
                 }
                 if let Some(offset) = latest.take() {
                     if write_offset(&store, &offset).await {
+                        if publisher.is_none() {
+                            notify(&offset);
+                        }
                         stored = Some(offset);
                     } else {
                         // Retry on the next tick unless a newer offset arrives first.
@@ -302,11 +337,14 @@ async fn checkpoint_writer<O: CdcOffset>(
                 }
                 if let Some(publisher) = publisher.as_mut()
                     && let Some(offset) = stored.as_ref()
-                    && offset.seq() > published_seq
+                    && (offset.seq() > published_seq
+                        || published.as_ref().is_some_and(|p| offset.advances_without_seq(p)))
                     && last_published.is_none_or(|t| t.elapsed() >= publisher.interval)
                 {
                     publisher.publish(offset).await;
+                    notify(offset);
                     published_seq = offset.seq();
+                    published = Some(offset.clone());
                     last_published = Some(Instant::now());
                 }
             }
@@ -318,13 +356,18 @@ async fn checkpoint_writer<O: CdcOffset>(
     if let Some(offset) = latest.take()
         && write_offset(&store, &offset).await
     {
+        if publisher.is_none() {
+            notify(&offset);
+        }
         stored = Some(offset);
     }
     if let Some(publisher) = publisher.as_mut()
         && let Some(offset) = stored.as_ref()
-        && offset.seq() > published_seq
+        && (offset.seq() > published_seq
+            || published.as_ref().is_some_and(|p| offset.advances_without_seq(p)))
     {
         publisher.publish(offset).await;
+        notify(offset);
     }
 }
 

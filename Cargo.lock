@@ -8981,6 +8981,17 @@ dependencies = [
 
 [[package]]
 name = "postgres-openssl"
+version = "0.5.2"
+source = "git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302#fcca71c8a6ee351eda7b6dfcd607055fa9a6d302"
+dependencies = [
+ "openssl",
+ "tokio",
+ "tokio-openssl",
+ "tokio-postgres 0.7.15",
+]
+
+[[package]]
+name = "postgres-openssl"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06743eefaa1a5c0ef2ccb6d9abf6528790a229eabd62ddcabf9b2a3aeff09fa4"
@@ -8988,7 +8999,7 @@ dependencies = [
  "openssl",
  "tokio",
  "tokio-openssl",
- "tokio-postgres",
+ "tokio-postgres 0.7.18",
 ]
 
 [[package]]
@@ -9010,6 +9021,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "postgres-protocol"
+version = "0.6.12"
+source = "git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302#fcca71c8a6ee351eda7b6dfcd607055fa9a6d302"
+dependencies = [
+ "base64 0.22.1",
+ "byteorder",
+ "bytes",
+ "fallible-iterator",
+ "hmac 0.13.0",
+ "md-5 0.11.0",
+ "memchr",
+ "rand 0.10.2",
+ "sha2 0.11.0",
+ "stringprep",
+]
+
+[[package]]
+name = "postgres-replication"
+version = "0.6.7"
+source = "git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302#fcca71c8a6ee351eda7b6dfcd607055fa9a6d302"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "futures-util",
+ "memchr",
+ "pin-project-lite",
+ "postgres-protocol 0.6.12 (git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302)",
+ "postgres-types 0.2.11",
+ "tokio-postgres 0.7.15",
+]
+
+[[package]]
+name = "postgres-types"
+version = "0.2.11"
+source = "git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302#fcca71c8a6ee351eda7b6dfcd607055fa9a6d302"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "postgres-protocol 0.6.12 (git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302)",
+]
+
+[[package]]
 name = "postgres-types"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9018,7 +9071,7 @@ dependencies = [
  "bytes",
  "chrono",
  "fallible-iterator",
- "postgres-protocol",
+ "postgres-protocol 0.6.12 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -12455,6 +12508,31 @@ dependencies = [
 
 [[package]]
 name = "tokio-postgres"
+version = "0.7.15"
+source = "git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302#fcca71c8a6ee351eda7b6dfcd607055fa9a6d302"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "fallible-iterator",
+ "futures-channel",
+ "futures-util",
+ "log",
+ "parking_lot",
+ "percent-encoding",
+ "phf 0.13.1",
+ "pin-project-lite",
+ "postgres-protocol 0.6.12 (git+https://github.com/MaterializeInc/rust-postgres?rev=fcca71c8a6ee351eda7b6dfcd607055fa9a6d302)",
+ "postgres-types 0.2.11",
+ "rand 0.9.4",
+ "socket2 0.6.5",
+ "tokio",
+ "tokio-util",
+ "whoami 1.6.1",
+]
+
+[[package]]
+name = "tokio-postgres"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3"
@@ -12470,8 +12548,8 @@ dependencies = [
  "percent-encoding",
  "phf 0.13.1",
  "pin-project-lite",
- "postgres-protocol",
- "postgres-types",
+ "postgres-protocol 0.6.12 (registry+https://github.com/rust-lang/crates.io-index)",
+ "postgres-types 0.2.14",
  "rand 0.10.2",
  "socket2 0.6.5",
  "tokio",
@@ -13673,7 +13751,9 @@ dependencies = [
  "parquet",
  "percent-encoding",
  "pin-project",
- "postgres-openssl",
+ "postgres-openssl 0.5.2",
+ "postgres-openssl 0.5.3",
+ "postgres-replication",
  "procfs",
  "proptest",
  "proptest-derive",
@@ -13725,7 +13805,8 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-openssl",
- "tokio-postgres",
+ "tokio-postgres 0.7.15",
+ "tokio-postgres 0.7.18",
  "tokio-stream",
  "tokio-test",
  "tokio-tungstenite",
@@ -14633,6 +14714,7 @@ checksum = "5d4a4db5077702ca3015d3d02d74974948aba2ad9e12ab7df718ee64ccd7e97d"
 dependencies = [
  "libredox",
  "wasite 0.1.0",
+ "web-sys",
 ]
 
 [[package]]

@@ -61,10 +61,12 @@ pub mod mongodb_metrics;
 #[cfg(feature = "sources-mqtt")]
 pub mod mqtt;
 // The shared change-data-capture core; every CDC connector feature enables it.
-#[cfg(feature = "sources-mysql_cdc")]
+#[cfg(any(feature = "sources-mysql_cdc", feature = "sources-postgres_cdc"))]
 pub mod cdc;
 #[cfg(feature = "sources-mysql_cdc")]
 pub mod mysql_cdc;
+#[cfg(feature = "sources-postgres_cdc")]
+pub mod postgres_cdc;
 #[cfg(feature = "sources-nats")]
 pub mod nats;
 #[cfg(feature = "sources-nginx_metrics")]
