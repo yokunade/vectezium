@@ -1,3 +1,19 @@
+> **Vectezium** is a fork of [Vector](https://github.com/vectordotdev/vector) v0.60.0 that adds
+> change data capture: `mysql_cdc` (binlog) and `postgres_cdc` (logical replication) sources that
+> write Debezium-compatible change events, with snapshots and at-least-once delivery, to an
+> Azure landing zone. The code is in [`src/sources/cdc`](src/sources/cdc) (the shared core),
+> [`src/sources/mysql_cdc`](src/sources/mysql_cdc) and [`src/sources/postgres_cdc`](src/sources/postgres_cdc);
+> configuration and the consumer contract are in [`contrib/mysql_cdc/README.md`](contrib/mysql_cdc/README.md).
+>
+> ```sh
+> cargo build --release --no-default-features \
+>   --features sources-mysql_cdc,sources-postgres_cdc,sinks-azure_blob,tikv-jemallocator
+> ```
+>
+> A runnable demo (MySQL and PostgreSQL to Azurite, with a live UI) is at
+> [yokunade/vectezium-demo](https://github.com/yokunade/vectezium-demo). Everything below is
+> Vector's own README.
+
 [![Nightly](https://github.com/vectordotdev/vector/actions/workflows/nightly.yml/badge.svg)](https://github.com/vectordotdev/vector/actions/workflows/nightly.yml)
 [![Integration/E2E Test Suite](https://github.com/vectordotdev/vector/actions/workflows/integration.yml/badge.svg)](https://github.com/vectordotdev/vector/actions/workflows/integration.yml)
 [![Component Features](https://github.com/vectordotdev/vector/actions/workflows/component_features.yml/badge.svg)](https://github.com/vectordotdev/vector/actions/workflows/component_features.yml)

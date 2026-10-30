@@ -1,3 +1,15 @@
+Vectezium is a modified version of Vector (https://github.com/vectordotdev/vector), forked from
+Vector v0.60.0 (commit 0d0b35865036f8b5c2f0104d9744fa84985ffff1). The `vectezium` branch adds a
+shared change-data-capture core, the mysql_cdc and postgres_cdc sources, and two azure_blob sink
+options; `git log 0d0b358..vectezium` lists every change.
+
+Modifications copyright (c) 2026 yokunade, licensed under the Mozilla Public License, version 2.0
+(MPL-2.0), like Vector itself. Source: https://github.com/yokunade/Vectezium
+
+Vector's NOTICE follows.
+
+--------------------------------------------------------------------------------------------------
+
 Unless explicitly stated otherwise all files in this repository are licensed under the Mozilla
 Public License, version 2.0 (MPL-2.0).
 
