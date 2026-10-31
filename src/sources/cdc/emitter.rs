@@ -299,8 +299,9 @@ impl<O: CdcOffset> Emitter<O> {
     pub fn check_health(&self) -> Result<(), String> {
         if self.poisoned.load(Ordering::SeqCst) {
             Err(
-                "a batch of change events was rejected downstream; stopping so the changes are \
-                 replayed from the last delivered offset after a restart"
+                "a batch of change events was rejected downstream, or offsets could not be \
+                 stored for minutes (see the errors above); stopping so the changes are \
+                 replayed from the last stored offset after a restart"
                     .into(),
             )
         } else {

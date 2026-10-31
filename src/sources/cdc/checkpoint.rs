@@ -42,6 +42,9 @@ pub const CHECKPOINT_FILENAME: &str = "offsets.json";
 /// How often the checkpoint file is rewritten while offsets keep advancing.
 const CHECKPOINT_WRITE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long offset writes may keep failing before the source stops.
+const CHECKPOINT_FAILURE_LIMIT: Duration = Duration::from_mins(5);
+
 /// A connector's resumable position. It always points at a transaction boundary, and carries
 /// the `seq` counters so replays after a restart number events exactly as before.
 pub trait CdcOffset:
@@ -220,8 +223,9 @@ impl<O: CdcOffset> Checkpoints<O> {
         stored: Option<tokio::sync::watch::Sender<Option<O>>>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel::<O>();
+        let failing = Arc::clone(&poisoned);
         crate::spawn_in_current_span(async move {
-            checkpoint_writer(rx, store, publisher, guard, stored).await;
+            checkpoint_writer(rx, store, publisher, guard, stored, failing).await;
             _ = written.send(());
         });
 
@@ -357,12 +361,15 @@ async fn checkpoint_writer<O: CdcOffset>(
     mut publisher: Option<OffsetPublisher>,
     guard: WriterGuard,
     stored_tx: Option<tokio::sync::watch::Sender<Option<O>>>,
+    poisoned: Arc<AtomicBool>,
 ) {
     let notify = |offset: &O| {
         if let Some(tx) = &stored_tx {
             tx.send_replace(Some(offset.clone()));
         }
     };
+    // Since when writes have failed without a success in between.
+    let mut failing_since: Option<tokio::time::Instant> = None;
     let mut latest: Option<O> = None;
     let mut stored: Option<O> = None;
     let mut published_seq = (0, 0);
@@ -395,6 +402,7 @@ async fn checkpoint_writer<O: CdcOffset>(
                 }
                 if let Some(offset) = latest.take() {
                     if write_offset(&store, &offset).await {
+                        failing_since = None;
                         if publisher.is_none() {
                             notify(&offset);
                         }
@@ -402,6 +410,19 @@ async fn checkpoint_writer<O: CdcOffset>(
                     } else {
                         // Retry on the next tick unless a newer offset arrives first.
                         latest = Some(offset);
+                        let since =
+                            *failing_since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() >= CHECKPOINT_FAILURE_LIMIT
+                            && !poisoned.swap(true, Ordering::SeqCst)
+                        {
+                            // Nothing advances while offsets cannot be stored (a PostgreSQL slot
+                            // keeps all its WAL): stop, so the failure is seen.
+                            error!(
+                                message = "Offsets could not be stored for too long; stopping the source.",
+                                path = %store.path().display(),
+                                failing_for = ?since.elapsed(),
+                            );
+                        }
                     }
                 }
                 if let Some(publisher) = publisher.as_mut()
@@ -540,6 +561,7 @@ mod tests {
             Some(publisher),
             WriterGuard::unlocked(),
             Some(release),
+            Arc::new(AtomicBool::new(false)),
         ));
         tx.send(TestOffset {
             lsn: 7,
@@ -565,6 +587,35 @@ mod tests {
             released_when(EventStatus::Delivered).await.map(|o| o.lsn),
             Some(7)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offsets_that_cannot_be_stored_stop_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(checkpoint_writer(
+            rx,
+            CheckpointStore::<TestOffset>::new(&dir.path().join("missing")),
+            None,
+            WriterGuard::unlocked(),
+            None,
+            Arc::clone(&poisoned),
+        ));
+        tx.send(TestOffset::default()).unwrap();
+        // Just short of the limit.
+        tokio::time::sleep(Duration::from_secs(295)).await;
+        assert!(
+            !poisoned.load(Ordering::SeqCst),
+            "a passing failure is retried"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            poisoned.load(Ordering::SeqCst),
+            "a lasting failure stops the source"
+        );
+        drop(tx);
+        writer.await.unwrap();
     }
 
     #[test]

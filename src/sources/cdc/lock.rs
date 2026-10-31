@@ -399,13 +399,30 @@ impl HeldLock {
         if !held {
             return;
         }
-        match self.blob.release_lease(self.lease_id, None).await {
+        match self.blob.release_lease(self.lease_id.clone(), None).await {
             Ok(_) => info!(message = "Released the single-writer lock.", lock = %self.name),
             Err(error) => warn!(
                 message = "Could not release the single-writer lock; it expires on its own.",
                 lock = %self.name,
                 %error,
             ),
+        }
+    }
+}
+
+impl Drop for HeldLock {
+    /// A lock dropped without [`HeldLock::release`] (the source's task was cancelled, for
+    /// example by a forced shutdown or a reload) must not keep renewing its lease: a successor
+    /// in the same process would wait for it forever. The lease is released in the background.
+    fn drop(&mut self) {
+        let held = self.guard.may_write();
+        self.guard.fence();
+        self.renewer.abort();
+        if held && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (blob, lease_id) = (Arc::clone(&self.blob), self.lease_id.clone());
+            runtime.spawn(async move {
+                _ = blob.release_lease(lease_id, None).await;
+            });
         }
     }
 }
@@ -483,6 +500,28 @@ mod tests {
         let mut empty = config(30);
         empty.blob_name = "/".into();
         assert!(empty.build(&proxy).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_lock_stops_renewing() {
+        let client = config(30).build(&ProxyConfig::default()).unwrap();
+        let renewer = tokio::spawn(std::future::pending::<()>());
+        let renewing = renewer.abort_handle();
+        let guard = WriterGuard::unlocked();
+        let held = HeldLock {
+            blob: client.blob,
+            name: client.name,
+            lease_id: "lease".into(),
+            guard: guard.clone(),
+            renewer,
+        };
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(
+            renewing.is_finished(),
+            "the renewer must stop with the lock"
+        );
+        assert!(!guard.may_write(), "a dropped lock must stop writes");
     }
 
     #[test]

@@ -59,6 +59,47 @@ async fn azure_blob_uploads_one_shot_with_shared_key() {
 }
 
 #[tokio::test]
+async fn azure_blob_retried_upload_of_a_landed_blob_succeeds() {
+    let config = AzureBlobSinkConfig::new_emulator().await;
+    let client = config.build_test_client();
+    let blob = client.blob_client(&format!("retry/{}.log", random_string(10)));
+    let upload = |data: &'static [u8]| {
+        super::service::upload_block_blob(
+            &blob,
+            false,
+            bytes::Bytes::from_static(data),
+            "text/plain",
+            None,
+            None,
+            None,
+        )
+    };
+
+    upload(
+        b"one batch
+",
+    )
+    .await
+    .expect("first attempt");
+    // A retry of an attempt that landed although it timed out: the same bytes, the same name.
+    upload(
+        b"one batch
+",
+    )
+    .await
+    .expect("a retry of a landed upload succeeds");
+    // Other bytes under the same name are a genuine collision.
+    assert!(
+        upload(
+            b"another batch
+"
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn azure_blob_uploads_multipart_with_shared_key() {
     let config = AzureBlobSinkConfig::new_emulator().await;
     let client = config.build_test_client();
