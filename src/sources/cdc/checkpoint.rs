@@ -32,7 +32,7 @@ use super::{
 };
 use crate::{
     SourceSender,
-    event::BatchStatus,
+    event::{BatchNotifier, BatchStatus, BatchStatusReceiver},
     internal_events::{CdcCheckpointWriteError, CdcDeliveryFailed},
 };
 
@@ -205,8 +205,9 @@ impl<O: CdcOffset> Checkpoints<O> {
     }
 
     /// Like [`Self::start`], and also reports on `stored` every offset the source may forget
-    /// the log before: each stored offset, or with `publish_offsets` each published one (a
-    /// source that lost its data directory resumes from the published offset). A connector whose
+    /// the log before: each stored offset, or with `publish_offsets` each published one once its
+    /// delivery is acknowledged (a source that lost its data directory resumes from the published
+    /// offset). A connector whose
     /// server keeps its log for it (a PostgreSQL replication slot) lets the server discard log
     /// only up to these offsets.
     pub fn start_notifying(
@@ -289,20 +290,26 @@ impl OffsetPublisher {
         payload
     }
 
-    /// Sends the offset event. Not acknowledged: a slow offsets sink must never hold back
+    /// Sends the offset event, and returns the receiver of its delivery status (`None` if the
+    /// output is closed). Checkpoints never wait for it: a slow offsets sink must not hold back
     /// checkpoints, and a lost event is superseded by the next one.
-    async fn publish<O: CdcOffset>(&mut self, offset: &O) {
-        let event = self.builder.plain(
-            Self::payload(&self.server_name, offset),
-            EventMeta {
-                key: None,
-                database: "",
-                table: None,
-                op: "offset",
-                timestamp: Utc::now(),
-                schema_version: None,
-            },
-        );
+    async fn publish<O: CdcOffset>(&mut self, offset: &O) -> Option<BatchStatusReceiver> {
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        let event = self
+            .builder
+            .plain(
+                Self::payload(&self.server_name, offset),
+                EventMeta {
+                    key: None,
+                    database: "",
+                    table: None,
+                    op: "offset",
+                    timestamp: Utc::now(),
+                    schema_version: None,
+                },
+            )
+            .with_batch_notifier(&batch);
+        drop(batch);
         if self
             .out
             .send_batch_named(OFFSETS_OUTPUT, vec![event])
@@ -310,8 +317,31 @@ impl OffsetPublisher {
             .is_err()
         {
             debug!(message = "The offsets output is closed; offset not published.");
+            return None;
         }
+        Some(receiver)
     }
+}
+
+/// Waits for a published offset's delivery and reports it on `acked`: the offset itself once
+/// delivered, `None` otherwise.
+fn await_delivery<O: CdcOffset>(
+    receiver: BatchStatusReceiver,
+    offset: O,
+    acked: mpsc::UnboundedSender<Option<O>>,
+) {
+    crate::spawn_in_current_span(async move {
+        let status = receiver.await;
+        let delivered = status == BatchStatus::Delivered;
+        if !delivered {
+            warn!(
+                message = "A published offset was not delivered; the log before it is kept until a \
+                           later one is.",
+                status = ?status,
+            );
+        }
+        _ = acked.send(delivered.then_some(offset));
+    });
 }
 
 /// Coalesces offsets and writes the newest one at most once per interval; publishes stored
@@ -338,6 +368,11 @@ async fn checkpoint_writer<O: CdcOffset>(
     let mut published_seq = (0, 0);
     let mut published: Option<O> = None;
     let mut last_published: Option<Instant> = None;
+    // A published offset counts (for `stored_tx`) only once delivered: a source that lost its
+    // data directory resumes from the offset in the lake, so the server must keep its log until
+    // the lake has that offset. One publication is in flight at a time.
+    let (acked_tx, mut acked_rx) = mpsc::unbounded_channel::<Option<O>>();
+    let mut in_flight = false;
     let mut tick = tokio::time::interval(CHECKPOINT_WRITE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -347,6 +382,12 @@ async fn checkpoint_writer<O: CdcOffset>(
                 Some(offset) => latest = Some(offset),
                 None => break,
             },
+            Some(acked) = acked_rx.recv() => {
+                in_flight = false;
+                if let Some(offset) = acked {
+                    notify(&offset);
+                }
+            }
             _ = tick.tick() => {
                 if !guard.may_write() {
                     // Not (or no longer certainly) the single writer: store and publish nothing.
@@ -364,13 +405,16 @@ async fn checkpoint_writer<O: CdcOffset>(
                     }
                 }
                 if let Some(publisher) = publisher.as_mut()
+                    && !in_flight
                     && let Some(offset) = stored.as_ref()
                     && (offset.seq() > published_seq
                         || published.as_ref().is_some_and(|p| offset.advances_without_seq(p)))
                     && last_published.is_none_or(|t| t.elapsed() >= publisher.interval)
                 {
-                    publisher.publish(offset).await;
-                    notify(offset);
+                    if let Some(receiver) = publisher.publish(offset).await {
+                        in_flight = true;
+                        await_delivery(receiver, offset.clone(), acked_tx.clone());
+                    }
                     published_seq = offset.seq();
                     published = Some(offset.clone());
                     last_published = Some(Instant::now());
@@ -396,8 +440,8 @@ async fn checkpoint_writer<O: CdcOffset>(
                 .as_ref()
                 .is_some_and(|p| offset.advances_without_seq(p)))
     {
-        publisher.publish(offset).await;
-        notify(offset);
+        // The source is stopping: nothing is released after this, so the delivery is not awaited.
+        _ = publisher.publish(offset).await;
     }
 }
 
@@ -466,6 +510,61 @@ mod tests {
         };
         store.store(&offset).await.unwrap();
         assert_eq!(store.load().await.unwrap(), Some(offset));
+    }
+
+    /// Publishes one offset, delivered downstream with `status`; returns what was released.
+    async fn released_when(status: vector_lib::event::EventStatus) -> Option<TestOffset> {
+        use vector_lib::config::LogNamespace;
+
+        use crate::sources::cdc::{EventFormat, RecordImages};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut out, _changes) = SourceSender::new_test();
+        let mut offsets = out.add_outputs(status, OFFSETS_OUTPUT.to_owned());
+        let publisher = OffsetPublisher {
+            out,
+            builder: EventBuilder::new(
+                "test",
+                LogNamespace::Legacy,
+                EventFormat::default(),
+                RecordImages::default(),
+            ),
+            server_name: "test".into(),
+            interval: Duration::ZERO,
+        };
+        let (release, released) = tokio::sync::watch::channel(None);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(checkpoint_writer(
+            rx,
+            CheckpointStore::<TestOffset>::new(dir.path()),
+            Some(publisher),
+            WriterGuard::unlocked(),
+            Some(release),
+        ));
+        tx.send(TestOffset {
+            lsn: 7,
+            next_seq: 2,
+            seq_sub: 0,
+            snapshot: false,
+        })
+        .unwrap();
+        // Stored and published; the offsets "sink" finalizes it with `status`.
+        drop(offsets.next().await.unwrap());
+        tokio::time::sleep(CHECKPOINT_WRITE_INTERVAL * 2).await;
+        drop(tx);
+        writer.await.unwrap();
+        released.borrow().clone()
+    }
+
+    #[tokio::test]
+    async fn a_published_offset_releases_the_log_only_once_delivered() {
+        use vector_lib::event::EventStatus;
+
+        assert_eq!(released_when(EventStatus::Errored).await, None);
+        assert_eq!(
+            released_when(EventStatus::Delivered).await.map(|o| o.lsn),
+            Some(7)
+        );
     }
 
     #[test]
