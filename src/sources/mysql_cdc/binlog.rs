@@ -19,7 +19,7 @@ use super::{
     convert::convert_binlog_value,
     ddl::{self, DdlKind},
     envelope::{Op, SnapshotMarker, SourceInfo},
-    incremental::Incremental,
+    incremental::{Incremental, StepError},
     offset::{GtidSet, IncrementalProgress, Offset, TableRef},
     schema::TableInfo,
     source::{
@@ -218,7 +218,10 @@ async fn run_connection(
                 .incremental
                 .step(settings, &position, emitter)
                 .await
-                .map_err(StreamError::Retry)?;
+                .map_err(|error| match error {
+                    StepError::Retry(error) => StreamError::Retry(error),
+                    StepError::Fatal(error) => StreamError::Fatal(error),
+                })?;
             if changed {
                 handler.commit_progress(emitter);
             }
@@ -285,6 +288,8 @@ struct Handler<'a> {
     held: Vec<TableRef>,
     /// The last signal applied; kept in every offset.
     last_signal: Option<String>,
+    /// A compressed transaction payload was read and none of its events have followed yet.
+    payload_unread: bool,
 }
 
 impl<'a> Handler<'a> {
@@ -305,6 +310,7 @@ impl<'a> Handler<'a> {
             position,
             tables: HashMap::new(),
             tx: Transaction::default(),
+            payload_unread: false,
         }
     }
 
@@ -313,6 +319,7 @@ impl<'a> Handler<'a> {
         self.tables.clear();
         self.incremental.reset_pending();
         self.tx = Transaction::default();
+        self.payload_unread = false;
         self.file = self.position.file.clone();
         self.last_end_pos = self.position.pos;
         self.last_start_pos = self.position.pos;
@@ -322,6 +329,24 @@ impl<'a> Handler<'a> {
     fn handle(&mut self, event: &Event, emitter: &mut Emitter) -> Result<(), String> {
         let header = event.header();
         let log_pos = u64::from(header.log_pos());
+        // mysql_async expands a compressed transaction payload into its events, but if the
+        // payload cannot be parsed or decompressed it yields none, silently. An event with a
+        // position right after a payload means its events never came.
+        if self.payload_unread {
+            self.payload_unread = false;
+            if log_pos != 0 {
+                self.settings.handle_failure(
+                    format!(
+                        "a compressed transaction payload in {} before position {log_pos} could \
+                         not be decompressed; its changes are missing. Re-snapshot the affected \
+                         tables",
+                        self.file
+                    ),
+                    "",
+                    "",
+                )?;
+            }
+        }
         // Events inside a compressed transaction payload carry no position; they inherit the
         // payload event's.
         if log_pos != 0 {
@@ -468,8 +493,10 @@ impl<'a> Handler<'a> {
             }
             EventData::XidEvent(_) => self.commit(emitter),
             EventData::XaPrepareLogEvent(data) => self.xa_prepare(&data, emitter)?,
-            // Format description, heartbeats, previous-GTIDs, compressed payload wrappers (their
-            // inner events follow), and other bookkeeping events need no action.
+            // Its events follow, expanded by mysql_async.
+            EventData::TransactionPayloadEvent(_) => self.payload_unread = true,
+            // Format description, heartbeats, previous-GTIDs and other bookkeeping events need
+            // no action.
             _ => {}
         }
         Ok(())

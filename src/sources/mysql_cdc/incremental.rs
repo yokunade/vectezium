@@ -233,7 +233,7 @@ impl Incremental {
         settings: &Settings,
         position: &GtidSet,
         emitter: &mut Emitter,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, StepError> {
         let mut changed = false;
         // At most one emit and one read per call, so streaming is never starved.
         if self
@@ -363,7 +363,11 @@ impl Incremental {
 
     /// Reads the next chunk of the first queued table into `pending`. Returns whether the queue
     /// changed (a table was skipped).
-    async fn read_chunk(&mut self, settings: &Settings, emitter: &Emitter) -> Result<bool, String> {
+    async fn read_chunk(
+        &mut self,
+        settings: &Settings,
+        emitter: &Emitter,
+    ) -> Result<bool, StepError> {
         let Some(progress) = self.progress.as_ref() else {
             return Ok(false);
         };
@@ -376,7 +380,11 @@ impl Incremental {
         }
 
         if self.conn.is_none() {
-            self.conn = Some(snapshot_connection(settings).await?);
+            self.conn = Some(
+                snapshot_connection(settings)
+                    .await
+                    .map_err(StepError::Retry)?,
+            );
         }
         let conn = self.conn.as_mut().expect("connected above");
         let result = read(
@@ -414,8 +422,9 @@ impl Incremental {
             }
             Err(ReadError::Fail(error)) => {
                 self.conn = None;
-                Err(error)
+                Err(StepError::Retry(error))
             }
+            Err(ReadError::Fatal(error)) => Err(StepError::Fatal(error)),
         }
     }
 }
@@ -424,11 +433,49 @@ fn progress_is_new(progress: Option<&IncrementalProgress>) -> bool {
     progress.is_some_and(|p| p.last_key.is_none() && p.rows == 0)
 }
 
+/// The placeholder that binds a key column's position in `(keys) > (…)`, or why the column
+/// cannot order chunks. The comparison must order exactly as `ORDER BY` does, or chunks skip
+/// rows.
+fn key_placeholder(name: &str, detail: &ColumnDetails) -> Result<String, String> {
+    if detail.nullable {
+        // `(k) > (NULL)` is NULL: the chunk after a NULL key comes back empty, ending the table.
+        return Err(format!(
+            "key column `{name}` is nullable, so the table cannot be read in key order; use \
+             NOT NULL columns in `pk_override`"
+        ));
+    }
+    match detail.data_type.as_str() {
+        // Sorted by their index but compared with a string as text.
+        "enum" | "set" => Err(format!(
+            "key column `{name}` is an {}, which sorts by its index but compares as text, so \
+             chunks could skip rows",
+            detail.data_type.to_uppercase()
+        )),
+        // A string compared with a DECIMAL is compared as a double: exact only as a DECIMAL.
+        "decimal" | "numeric" => Ok(format!(
+            "CAST(? AS DECIMAL({}, {}))",
+            detail.precision.unwrap_or(65),
+            detail.scale.unwrap_or(0)
+        )),
+        _ => Ok("?".into()),
+    }
+}
+
 enum ReadError {
     /// The table cannot be snapshotted incrementally; skip it.
     Skip(String),
     /// A database error; retry later.
     Fail(String),
+    /// A row could not be converted and `event_processing_failure_handling_mode` is `fail`.
+    Fatal(String),
+}
+
+/// Why a step of the incremental snapshot failed.
+pub enum StepError {
+    /// A database error: reconnect and retry.
+    Retry(String),
+    /// Stop the source.
+    Fatal(String),
 }
 
 async fn gtid_executed(conn: &mut Conn) -> Result<GtidSet, ReadError> {
@@ -499,6 +546,12 @@ async fn read(
             "key column `{missing}` does not exist"
         )));
     }
+    let placeholders = keys
+        .iter()
+        .map(|k| key_placeholder(k, &details[k]))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ReadError::Skip)?
+        .join(", ");
 
     let mut columns: Vec<(&String, &ColumnDetails)> = details.iter().collect();
     columns.sort_by_key(|(_, detail)| detail.position);
@@ -534,7 +587,6 @@ async fn read(
                     "the stored chunk position is not a valid key; snapshot it again".into(),
                 )
             })?;
-        let placeholders = vec!["?"; params.len()].join(", ");
         write!(query, " WHERE ({key_list}) > ({placeholders})").expect("writing to a String");
     }
     let limit = settings.incremental_chunk_size;
@@ -591,9 +643,10 @@ async fn read(
                 chunk_rows.push((key_text, event));
             }
             Err(error) => {
+                // In `fail` mode the same row fails on every retry: stop instead.
                 settings
                     .handle_failure(error, database, table)
-                    .map_err(ReadError::Fail)?;
+                    .map_err(ReadError::Fatal)?;
             }
         }
     }
@@ -666,6 +719,41 @@ mod tests {
 
     fn t(table: &str) -> TableRef {
         ("shop".into(), table.into())
+    }
+
+    #[test]
+    fn key_columns_bind_so_chunks_order_like_order_by() {
+        let column = |data_type: &str, nullable: bool| ColumnDetails {
+            position: 1,
+            data_type: data_type.into(),
+            nullable,
+            unsigned: false,
+            precision: Some(12),
+            scale: Some(2),
+            fsp: 0,
+            bit_len: 0,
+            primary_key: false,
+            values: None,
+        };
+        assert_eq!(
+            key_placeholder("id", &column("bigint", false)).unwrap(),
+            "?"
+        );
+        assert_eq!(
+            key_placeholder("price", &column("decimal", false)).unwrap(),
+            "CAST(? AS DECIMAL(12, 2))"
+        );
+        assert!(
+            key_placeholder("tenant", &column("int", true))
+                .unwrap_err()
+                .contains("nullable")
+        );
+        assert!(
+            key_placeholder("status", &column("enum", false))
+                .unwrap_err()
+                .contains("ENUM")
+        );
+        assert!(key_placeholder("tags", &column("set", false)).is_err());
     }
 
     #[test]
