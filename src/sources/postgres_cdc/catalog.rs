@@ -270,6 +270,8 @@ pub struct TableInfo {
     pub columns: Vec<Column>,
     /// Indexes into `columns` of the key (the primary key, or `pk_override`).
     pub key: Vec<usize>,
+    /// Indexes into `columns` of the replica identity: the columns an old-key tuple carries.
+    pub identity: Vec<usize>,
     /// `pg_class.relreplident`: `d` (default), `f` (full), `i` (index), `n` (nothing).
     pub replica_identity: char,
     pub schema_core: serde_json::Map<String, serde_json::Value>,
@@ -334,6 +336,8 @@ pub struct RelationColumn {
     pub name: String,
     pub type_oid: u32,
     pub typmod: i32,
+    /// Part of the replica identity (the message's key flag): an old-key tuple carries it.
+    pub identity: bool,
 }
 
 impl TableInfo {
@@ -355,6 +359,9 @@ impl TableInfo {
                 name: c.name.clone(),
                 type_oid: c.type_oid,
                 typmod: c.typmod,
+                // As the server flags it, except for an identity index (the stream's `Relation`
+                // message says which columns that has).
+                identity: identity == 'f' || (identity == 'd' && c.pk_position.is_some()),
             })
             .collect::<Vec<_>>();
         Self::from_relation(client, registry, filters, convert, schema, table, &columns)
@@ -418,6 +425,11 @@ impl TableInfo {
             pk.sort_unstable();
             pk.into_iter().map(|(_, i)| i).collect()
         };
+        let identity_columns = relation
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.identity.then_some(i))
+            .collect();
         let schema_core = table_schema::core(schema, table, &columns, &key, convert);
         let schema_version = table_schema::version(&schema_core);
         Ok(Self {
@@ -425,6 +437,7 @@ impl TableInfo {
             table: table.to_owned(),
             columns,
             key,
+            identity: identity_columns,
             replica_identity: identity,
             schema_core,
             schema_version,
@@ -439,6 +452,16 @@ impl TableInfo {
                 .iter()
                 .zip(&other.columns)
                 .any(|(a, b)| a.name != b.name || a.type_oid != b.type_oid || a.typmod != b.typmod)
+    }
+
+    /// The key columns an old-key tuple does not carry (they are outside the replica identity):
+    /// a delete, or a key change, cannot give their old values.
+    pub fn key_outside_identity(&self) -> Vec<&str> {
+        self.key
+            .iter()
+            .filter(|i| !self.identity.contains(i))
+            .map(|&i| self.columns[i].name.as_str())
+            .collect()
     }
 }
 
@@ -555,6 +578,35 @@ mod tests {
             Kind::Array(Box::new(Kind::Enum))
         );
         assert_eq!(registry.resolve(50003).kind, Kind::Numeric);
+    }
+
+    #[test]
+    fn key_columns_outside_the_replica_identity() {
+        let named = |name: &str| Column {
+            name: name.into(),
+            ..column(Kind::Int32, -1)
+        };
+        let info = |key: Vec<usize>, identity: Vec<usize>| TableInfo {
+            schema: "public".into(),
+            table: "t".into(),
+            columns: vec![named("id"), named("tenant"), named("code")],
+            key,
+            identity,
+            replica_identity: 'i',
+            schema_core: serde_json::Map::new(),
+            schema_version: String::new(),
+        };
+        // The primary key is the identity.
+        assert!(info(vec![0], vec![0]).key_outside_identity().is_empty());
+        // `pk_override` wider than the identity.
+        assert_eq!(
+            info(vec![0, 1], vec![0]).key_outside_identity(),
+            vec!["tenant"]
+        );
+        // REPLICA IDENTITY USING INDEX on another unique column.
+        assert_eq!(info(vec![0], vec![2]).key_outside_identity(), vec!["id"]);
+        // No key: nothing to carry.
+        assert!(info(vec![], vec![]).key_outside_identity().is_empty());
     }
 
     #[test]

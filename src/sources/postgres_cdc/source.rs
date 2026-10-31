@@ -85,7 +85,7 @@ pub(super) struct Settings {
     pub publish_offsets: Option<Duration>,
     pub status_interval: Duration,
     pub signals: Option<SignalsConfig>,
-    /// Tables already reported as having no key.
+    /// Tables already reported as having no key (or a key outside the replica identity).
     pub warned_no_key: Mutex<HashSet<String>>,
 }
 
@@ -105,6 +105,30 @@ impl Settings {
                 message = "Table has no primary key; its change events carry no key, so a downstream \
                            merge cannot identify rows. Add a primary key or set `pk_override.<schema>.<table>`.",
                 table = %name,
+                internal_log_rate_limit = false,
+            );
+        }
+    }
+
+    /// Warns once per table whose key has columns outside its replica identity: the server
+    /// sends only the identity columns of a deleted row, or of a row whose identity changed.
+    pub fn warn_if_key_outside_identity(&self, info: &TableInfo) {
+        let outside = info.key_outside_identity();
+        if outside.is_empty() {
+            return;
+        }
+        let name = format!("{}.{}", info.schema, info.table);
+        let first = self
+            .warned_no_key
+            .lock()
+            .is_ok_and(|mut warned| warned.insert(format!("{name} identity")));
+        if first {
+            warn!(
+                message = "Key columns are not in the table's replica identity, so deletes (and key \
+                           changes) cannot be keyed; they fail per `event_processing_failure_handling_mode`. \
+                           Set REPLICA IDENTITY FULL, or make the identity cover the key.",
+                table = %name,
+                columns = %outside.join(", "),
                 internal_log_rate_limit = false,
             );
         }
