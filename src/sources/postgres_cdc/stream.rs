@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use pgrepl_tokio_postgres::Client;
 use postgres_replication::protocol::{LogicalReplicationMessage as M, Tuple, TupleData};
 use serde_json::{Map, Value as Json};
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 
 use super::{
     catalog::{RelationColumn, TableInfo, TypeRegistry},
@@ -97,24 +97,7 @@ pub(super) async fn stream(
     mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
     info!(message = "Streaming changes from the replication slot.", offset = %start);
-    // The definitions to compare the stream's `Relation` messages with: as the catalog has them
-    // now (the snapshot's, right after a snapshot). The first change of a table after an
-    // `ALTER TABLE` then shows up as a schema change, even if the table had no change before it.
-    let mut known = HashMap::with_capacity(captured.len());
-    for (schema, table) in captured {
-        if let Some(info) = TableInfo::from_catalog(
-            &query,
-            registry,
-            &settings.filters,
-            &settings.convert,
-            schema,
-            table,
-        )
-        .await?
-        {
-            known.insert((schema.clone(), table.clone()), info);
-        }
-    }
+    let known = known_tables(settings, &query, registry, captured).await?;
     let mut state = State {
         settings,
         query,
@@ -131,6 +114,9 @@ pub(super) async fn stream(
         released: Lsn(0),
     };
     loop {
+        if !reconnect_query(&mut state, &mut shutdown).await {
+            return Ok(());
+        }
         let Some(client) = connect_retrying(settings, true, &mut shutdown).await else {
             return Ok(());
         };
@@ -169,15 +155,23 @@ pub(super) async fn stream(
         state.txn = None;
         // A chunk read for the previous connection is read again (from the stored progress).
         state.window = None;
-        match session(
+        let end = match session(
             &mut state,
             &mut replication,
             emitter,
             &mut released,
             &mut shutdown,
         )
-        .await?
+        .await
         {
+            Ok(end) => end,
+            // A catalog query failed because its connection is gone: reconnect both.
+            Err(error) if state.query.is_closed() => {
+                End::Disconnected(format!("the catalog connection closed: {error}"))
+            }
+            Err(error) => return Err(error),
+        };
+        match end {
             End::Shutdown => return Ok(()),
             End::Disconnected(error) => {
                 emitter.discard_uncommitted();
@@ -195,6 +189,45 @@ pub(super) async fn stream(
     }
 }
 
+/// The definitions to compare the stream's `Relation` messages with: as the catalog has them now
+/// (the snapshot's, right after a snapshot). The first change of a table after an `ALTER TABLE`
+/// then shows up as a schema change, even if the table had no change before it.
+async fn known_tables(
+    settings: &Settings,
+    query: &Client,
+    registry: &TypeRegistry,
+    captured: &[TableRef],
+) -> Result<HashMap<TableRef, TableInfo>, String> {
+    let mut known = HashMap::with_capacity(captured.len());
+    for (schema, table) in captured {
+        if let Some(info) = TableInfo::from_catalog(
+            query,
+            registry,
+            &settings.filters,
+            &settings.convert,
+            schema,
+            table,
+        )
+        .await?
+        {
+            known.insert((schema.clone(), table.clone()), info);
+        }
+    }
+    Ok(known)
+}
+
+/// Reconnects the catalog connection if it closed: it goes down with the server too (a restart,
+/// a failover). `false` if shutdown was requested first.
+async fn reconnect_query(state: &mut State<'_>, shutdown: &mut ShutdownSignal) -> bool {
+    if state.query.is_closed() {
+        let Some(query) = connect_retrying(state.settings, false, shutdown).await else {
+            return false;
+        };
+        state.query = query;
+    }
+    true
+}
+
 /// Reads one replication connection until it breaks or the source shuts down.
 async fn session(
     state: &mut State<'_>,
@@ -209,8 +242,10 @@ async fn session(
     let mut flush = tokio::time::interval(Duration::from_millis(100));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The server sends keepalives at half its `wal_sender_timeout`; silence for much longer means
-    // the connection is gone.
+    // the connection is gone (a half-open TCP connection never errors on its own). Measured from
+    // the last message, not per `select!` pass: the other branches wake the loop far more often.
     let silence = interval * 3 + Duration::from_mins(1);
+    let mut last_message = Instant::now();
     if let Some(end) = open_window(state, replication).await? {
         return Ok(end);
     }
@@ -218,6 +253,9 @@ async fn session(
         tokio::select! {
             _ = &mut *shutdown => return Ok(End::Shutdown),
             _ = status.tick() => {
+                if last_message.elapsed() >= silence {
+                    return Ok(End::Disconnected(format!("no message from the server for {silence:?}")));
+                }
                 if let Err(error) = replication.status(state.received, state.released).await {
                     return Ok(End::Disconnected(format!("failed to send a status update: {}", error_text(&error))));
                 }
@@ -233,14 +271,14 @@ async fn session(
                 emitter.maybe_flush().await?;
                 emitter.check_health()?;
             }
-            next = tokio::time::timeout(silence, replication.next()) => {
+            next = replication.next() => {
                 let received = match next {
-                    Err(_) => return Ok(End::Disconnected(format!("no message from the server for {silence:?}"))),
-                    Ok(Err(error)) => return Ok(End::Disconnected(error_text(&error))),
+                    Err(error) => return Ok(End::Disconnected(error_text(&error))),
                     // The server ended the stream (for example `wal_sender_timeout`).
-                    Ok(Ok(None)) => return Ok(End::Disconnected("the server ended the replication stream".into())),
-                    Ok(Ok(Some(received))) => received,
+                    Ok(None) => return Ok(End::Disconnected("the server ended the replication stream".into())),
+                    Ok(Some(received)) => received,
                 };
+                last_message = Instant::now();
                 match received {
                     Received::KeepAlive { wal_end, reply } => {
                         state.received = state.received.max(wal_end);
