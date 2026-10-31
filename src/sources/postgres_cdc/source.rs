@@ -991,10 +991,10 @@ async fn run(
     } else {
         // Starting over: a leftover slot cannot give a snapshot, so it is replaced, but only if
         // it is this source's: another source on the database may be using the slot name.
+        let ours = stored
+            .as_ref()
+            .is_some_and(|offset| offset.slot_name == settings.slot_name);
         if slot != SlotState::Missing {
-            let ours = stored
-                .as_ref()
-                .is_some_and(|offset| offset.slot_name == settings.slot_name);
             if !ours && slot != SlotState::Lost {
                 return Err(format!(
                     "replication slot `{slot_name}` exists, but this source has no stored offset \
@@ -1007,6 +1007,18 @@ async fn run(
             }
             info!(message = "Dropping the replication slot to create it again with a snapshot.", slot = %settings.slot_name);
             drop_slot(&query, &settings).await?;
+        }
+        if !ours {
+            // Stored before the slot is created, so the next start knows the slot is this
+            // source's (and replaces it) if this start stops before storing another offset.
+            let mut claim = Offset::new(Lsn(0), &settings.slot_name, Some(system_id.clone()));
+            if let Some(offset) = &stored {
+                (claim.next_seq, claim.seq_sub) = (offset.next_seq, offset.seq_sub);
+            }
+            CheckpointStore::new(&data_dir)
+                .store(&claim)
+                .await
+                .map_err(|error| format!("failed to store an offset in {offset_file}: {error}"))?;
         }
         let snapshotting = stored.is_some() || settings.snapshot_mode != SnapshotMode::NoData;
         if snapshotting && settings.snapshot_strategy == SnapshotStrategy::Blocking {

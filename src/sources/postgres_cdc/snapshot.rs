@@ -84,14 +84,6 @@ pub(super) async fn run(
         .cloned()
         .flatten()
         .ok_or("CREATE_REPLICATION_SLOT exported no snapshot")?;
-    // An offset naming the slot, so the next start knows the slot is this source's (and takes
-    // the snapshot again) if this one does not complete.
-    emitter.commit(Offset::new(
-        lsn,
-        &settings.slot_name,
-        Some(system_id.to_owned()),
-    ));
-    emitter.flush().await?;
 
     // The tables as the catalog describes them now.
     let mut tables = Vec::with_capacity(captured.len());
