@@ -180,12 +180,32 @@ master sequence per source, as a fixed-width string that sorts correctly as text
 
 * The **first part** (20 digits) counts binlog-derived events: changes, `truncate` and
   `schema_change`. Each advances it by one, and it is stored with the offset, so events replayed
-  after a crash get the **same** `seq`: a duplicate is identical, `seq` included.
+  after a crash get the **same** `seq`: a repeated change is identical, `seq` included.
 * The **second part** (10 digits) positions snapshot-derived events (`r` rows and
   `snapshot_completed`) after the latest binlog event, without advancing the counter, because
-  when a snapshot chunk is emitted differs between runs.
+  when a snapshot chunk is emitted differs between runs. So, unlike a change, a snapshot read
+  does **not** keep its `seq` across a crash (see [Duplicates](#duplicates)).
 * Apply events in `seq` order (`AUTO CDC … SEQUENCE BY seq`); no other field is needed. For a
   number, `CAST(seq AS DECIMAL(30,10))` is exact.
+
+### Duplicates
+
+Delivery is at-least-once: after a crash, events since the last stored offset arrive again.
+Drop the repeats by kind of event:
+
+| Events | A repeat | Deduplicate on |
+|---|---|---|
+| Changes (`c`, `u`, `d`), `truncate`, `schema_change` | Is identical, `seq` included | `seq` |
+| Snapshot reads (`r`) | May have a different `seq`, and its `seq` may belong to a different row in each delivery | `(seq, snapshot_id, key)`, or keep both |
+| `snapshot_completed` | May have a different `seq` | `(snapshot_id, db, table)` |
+
+**Never deduplicate snapshot reads on `seq` alone.** A snapshot read again after a crash numbers
+its rows afresh: a blocking snapshot's parallel readers emit rows in a different order each run,
+and a resumed incremental snapshot (same `snapshot_id`) may emit a chunk at a different point in
+the stream, with different rows. One `seq` can then name one row in the first delivery and
+another in the second, and dropping the second as a repeat loses a real row. With the key
+included the rows stay apart. A snapshot read delivered twice is harmless when applied with
+`SEQUENCE BY seq`: each copy is consistent with the changes around it, and the later `seq` wins.
 
 ### Row events are CRUD only
 
@@ -249,7 +269,8 @@ a blocking buffer would still make the source wait to hand them over.
 ### Applying it downstream (for example Databricks)
 
 * **Per table:** a CRUD merge keyed on `metadata.key`, `SEQUENCE BY seq`, with `d` as delete
-  (Databricks `AUTO CDC`).
+  (Databricks `AUTO CDC`). If you deduplicate before it, use the keys in
+  [Duplicates](#duplicates), not `seq` alone.
 * **`truncate`:** delete the table's rows with a lower `seq` than the event (or feed it to
   `apply_as_truncates` for SCD type 1).
 * **`snapshot_completed`:** once you hold `rows` rows of the table with its `snapshot_id`, delete
@@ -434,8 +455,8 @@ sink in the example configs uses so re-emitted schema documents rewrite their ow
 * Offsets always point at **transaction boundaries** (after `XID`/`COMMIT`, or after a DDL).
 * With `acknowledgements` enabled, an offset is written only after **every event up to it** was
   acknowledged by the sinks. A crash replays from the last acknowledged transaction:
-  **at-least-once**, like Debezium. Replayed events carry the same `seq` as their first
-  delivery, so deduplicate on `seq` (or on `(gtid, pos, row, op)`).
+  **at-least-once**, like Debezium. Replayed changes carry the same `seq` as their first
+  delivery; snapshot reads may not. See [Duplicates](#duplicates) for what to deduplicate on.
 * With `publish_offsets`, the published offset marks the delivered, transaction-complete prefix.
 * If a sink permanently rejects a batch, the source stops advancing offsets and shuts down so the
   data is replayed after a restart rather than skipped.
@@ -488,7 +509,7 @@ reads the lake (after taking the `single_writer_lock`, with its storage settings
 
 | The lake has | The source |
 |---|---|
-| A published offset with `checkpoint` | Stores it as its offset and resumes from it: same position, same `seq` numbering, same table-snapshot state. Events after it are read again with the `seq` they had (duplicates to drop by `seq`). |
+| A published offset with `checkpoint` | Stores it as its offset and resumes from it: same position, same `seq` numbering, same table-snapshot state. Events after it are read again: changes with the `seq` they had, snapshot reads possibly not (see [Duplicates](#duplicates)). |
 | A published offset without `checkpoint` (published by an earlier version) | Rebuilds the offset from its position and `seq`, and the snapshotted tables from the `snapshot_completed` events under `control_prefix` (required in this case). Other captured tables follow `unplanned_snapshots`. |
 | Nothing under `folder` but the lock blob | Starts from scratch (first start). |
 | No published offset, but other blobs under `folder` | Stops with an error listing some of them: restore the data directory or the published offset, or use a new folder. |
