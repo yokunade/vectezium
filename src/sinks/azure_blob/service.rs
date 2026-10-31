@@ -88,7 +88,7 @@ impl Service<AzureBlobRequest> for AzureBlobService {
     }
 }
 
-async fn upload_block_blob(
+pub(super) async fn upload_block_blob(
     blob_client: &BlobClient,
     overwrite: bool,
     data: Bytes,
@@ -111,12 +111,38 @@ async fn upload_block_blob(
         upload_options.if_not_exists()
     };
 
-    blob_client
+    match blob_client
         .upload(RequestContent::from(data.to_vec()), Some(upload_options))
         .instrument(info_span!("request").or_current())
         .await
-        .map(|_| ())
-        .map_err(Into::into)
+    {
+        Ok(_) => Ok(()),
+        // An earlier attempt of this request may have landed although it timed out (a retry, by
+        // the sink or by the SDK): the blob then already holds exactly these bytes.
+        Err(error)
+            if !overwrite
+                && storage_error_code(&error).as_deref()
+                    == Some(StorageErrorCode::BlobAlreadyExists.as_ref())
+                && already_written(blob_client, &data).await =>
+        {
+            debug!(message = "The blob was already written by an earlier attempt of this request.");
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the existing blob holds exactly `data`. A blob with other content (a genuine name
+/// collision) keeps the upload failing.
+async fn already_written(blob_client: &BlobClient, data: &Bytes) -> bool {
+    match blob_client.download(None).await {
+        Ok(response) => response
+            .body
+            .collect()
+            .await
+            .is_ok_and(|existing| existing == *data),
+        Err(_) => false,
+    }
 }
 
 // Extracts the Azure storage error code string from an azure_core::Error, if present.

@@ -216,8 +216,10 @@ pub struct AzureBlobSinkConfig {
     /// Replace a block blob that already exists under the same name.
     ///
     /// By default an upload never overwrites an existing blob (the request fails with
-    /// `409 Conflict`). Enabling this is useful when blob names are deterministic and a rewrite
-    /// is idempotent, for example one file per schema version. Ignored for append blobs.
+    /// `409 Conflict`, unless the blob already holds exactly the same bytes: an earlier
+    /// attempt of the same request that landed although it timed out). Enabling this is useful
+    /// when blob names are deterministic and a rewrite is idempotent, for example one file per
+    /// schema version. Ignored for append blobs.
     #[serde(default)]
     pub blob_overwrite: bool,
 
