@@ -204,7 +204,11 @@ async fn run_connection(
             }
         }
 
-        emitter.maybe_flush().await.map_err(StreamError::Fatal)?;
+        // An open XA transaction's rows may still be dropped at its `XA_prepare` event, so they
+        // are held back until then rather than flushed part-way.
+        if handler.tx.xa.is_none() {
+            emitter.maybe_flush().await.map_err(StreamError::Fatal)?;
+        }
     }
 }
 
@@ -221,6 +225,11 @@ struct Transaction {
     commit_ts_us: Option<i64>,
     /// SQL of the current statement (`binlog_rows_query_log_events=ON`).
     query: Option<String>,
+    /// Inside `XA START` … `XA PREPARE`: the XA transaction id, as the binlog spells it.
+    xa: Option<String>,
+    /// Captured changes of the XA transaction, `(database, table, key)`: they reach the
+    /// incremental snapshot only if the transaction commits in one phase.
+    xa_changes: Vec<(String, String, Option<Map<String, Json>>)>,
 }
 
 struct Handler<'a> {
@@ -338,11 +347,17 @@ impl<'a> Handler<'a> {
                     // End of a transaction on a non-transactional engine (a ROLLBACK here still
                     // means the non-transactional row changes were applied).
                     self.commit(emitter);
+                } else if let Some(xid) = strip_prefix_ignore_case(statement, "XA START ") {
+                    // An XA transaction's rows follow, up to `XA END` and an `XA_prepare` event.
+                    self.tx.in_tx = true;
+                    self.tx.xa = Some(xid.trim().to_owned());
+                } else if starts_with_ignore_case(statement, "XA COMMIT ")
+                    || starts_with_ignore_case(statement, "XA ROLLBACK ")
+                {
+                    // The second phase of a prepared XA transaction: its own GTID, no rows.
+                    self.commit(emitter);
                 } else if starts_with_ignore_case(statement, "XA ") {
-                    warn!(
-                        message = "XA transactions are not supported; skipping statement.",
-                        statement = %statement,
-                    );
+                    // `XA END`: the rows are over; the `XA_prepare` event ends the group.
                 } else if self.tx.in_tx {
                     // `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and similar statements carry no row
                     // data. A write here was logged in statement format: its rows are not in
@@ -415,6 +430,7 @@ impl<'a> Handler<'a> {
                 self.rows(&rows, header.server_id(), header_ts_us, emitter)?;
             }
             EventData::XidEvent(_) => self.commit(emitter),
+            EventData::XaPrepareLogEvent(data) => self.xa_prepare(&data, emitter)?,
             // Format description, heartbeats, previous-GTIDs, compressed payload wrappers (their
             // inner events follow), and other bookkeeping events need no action.
             _ => {}
@@ -477,7 +493,15 @@ impl<'a> Handler<'a> {
                     continue;
                 }
             };
-            if self.incremental.has_work() {
+            if self.tx.xa.is_some() {
+                // Whether an XA transaction commits is known only at its `XA_prepare` event.
+                for image in [&before, &after].into_iter().flatten() {
+                    let key = image.1.clone();
+                    self.tx
+                        .xa_changes
+                        .push((info.database.clone(), info.table.clone(), key));
+                }
+            } else if self.incremental.has_work() {
                 let gtid = self.tx.gtid.clone();
                 let gtid = gtid.as_ref().map(|(sid, gno)| (sid.as_str(), *gno));
                 for image in [&before, &after].into_iter().flatten() {
@@ -740,6 +764,41 @@ impl<'a> Handler<'a> {
     }
 
     /// Ends the current transaction: records its GTID and the position after it.
+    /// Ends an XA transaction's first group. `XA COMMIT … ONE PHASE` commits it here. `XA PREPARE`
+    /// does not: the transaction commits or rolls back later, in a group of its own, and the rows
+    /// are not kept until then, so a prepared transaction that changed captured tables is a
+    /// failure (skipped, with its rows, unless `event_processing_failure_handling_mode: fail`).
+    fn xa_prepare(&mut self, data: &[u8], emitter: &mut Emitter) -> Result<(), String> {
+        // The event body starts with the `one_phase` flag.
+        let one_phase = data.first().is_some_and(|flag| *flag != 0);
+        let changes = std::mem::take(&mut self.tx.xa_changes);
+        if one_phase {
+            if self.incremental.has_work() {
+                let gtid = self.tx.gtid.clone();
+                let gtid = gtid.as_ref().map(|(sid, gno)| (sid.as_str(), *gno));
+                for (database, table, key) in &changes {
+                    self.incremental
+                        .on_change(database, table, key.as_ref(), gtid);
+                }
+            }
+        } else if let Some((database, table, _)) = changes.first() {
+            let xid = self.tx.xa.as_deref().unwrap_or_default();
+            self.settings.handle_failure(
+                format!(
+                    "XA transaction {xid} was prepared (two-phase XA), and two-phase XA \
+                     transactions are not supported: whether its changes commit is only known \
+                     later. Set `event_processing_failure_handling_mode` to `warn` to skip such \
+                     transactions, then re-snapshot the tables they change"
+                ),
+                database,
+                table,
+            )?;
+            emitter.discard_uncommitted();
+        }
+        self.commit(emitter);
+        Ok(())
+    }
+
     fn commit(&mut self, emitter: &mut Emitter) {
         if let Some((source_id, gno)) = self.tx.gtid.take() {
             self.position.gtid_set.add(&source_id, gno);
@@ -899,6 +958,15 @@ fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
+/// `s` without `prefix` (an ASCII prefix, compared case-insensitively).
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if starts_with_ignore_case(s, prefix) {
+        s.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +976,14 @@ mod tests {
         assert!(starts_with_ignore_case("xa start 'x'", "XA "));
         assert!(!starts_with_ignore_case("XAB", "XA "));
         assert!(!starts_with_ignore_case("X", "XA "));
+        assert_eq!(
+            strip_prefix_ignore_case("xa start X'7031',X'',1", "XA START "),
+            Some("X'7031',X'',1")
+        );
+        assert_eq!(
+            strip_prefix_ignore_case("XA END X'7031'", "XA START "),
+            None
+        );
+        assert_eq!(strip_prefix_ignore_case("XA", "XA START "), None);
     }
 }

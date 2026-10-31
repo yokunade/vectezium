@@ -508,7 +508,12 @@ checkpoint write errors and delivery failures increment `component_errors_total`
 * MariaDB (different GTID format and binlog events).
 * Ad-hoc snapshots on request (Debezium signals); a table can be re-snapshotted by removing it
   from `snapshotted_tables` in the offset file while stopped, with `snapshot_new_tables: true`.
-* XA transactions; partial JSON updates (`binlog_row_value_options=PARTIAL_JSON` is rejected).
+* Two-phase XA transactions (`XA PREPARE`, then `XA COMMIT` or `XA ROLLBACK`): whether their
+  changes commit is only known later, in a separate binlog group. One that changes a captured
+  table stops the source; with `event_processing_failure_handling_mode: warn` or `skip` its
+  changes are left out instead (re-snapshot the tables afterwards). One-phase XA
+  (`XA COMMIT … ONE PHASE`) is captured like any other transaction.
+* Partial JSON updates (`binlog_row_value_options=PARTIAL_JSON` is rejected).
 * `snapshot_locking_mode: minimal` needs `FLUSH TABLES WITH READ LOCK`; on managed services that
   forbid it, use `none` and start the snapshot during a quiet period.
 * Incremental snapshots read one table at a time.
