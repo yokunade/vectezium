@@ -1,6 +1,6 @@
-//! `mysql_cdc` source: Debezium-compatible change data capture from the MySQL binlog.
+//! `mysql_cdc` source: Debezium-compatible change data capture from the `MySQL` binlog.
 //!
-//! The source registers with MySQL as a replica, optionally takes a consistent initial snapshot,
+//! The source registers with `MySQL` as a replica, optionally takes a consistent initial snapshot,
 //! and then streams row-based binlog events. Each row change is emitted as a log event whose body
 //! is a Debezium change-event payload (`before`, `after`, `source`, `op`, `ts_ms`, …).
 //!
@@ -8,7 +8,7 @@
 //! downstream sinks (when end-to-end acknowledgements are enabled), giving at-least-once
 //! delivery across restarts. Offsets always point at transaction boundaries.
 //!
-//! Server requirements: MySQL 8.0+ with `log_bin=ON`, `binlog_format=ROW`,
+//! Server requirements: `MySQL` 8.0+ with `log_bin=ON`, `binlog_format=ROW`,
 //! `binlog_row_image=FULL` and `binlog_row_metadata=FULL`. GTID mode is recommended.
 
 use std::{collections::HashMap, path::PathBuf};
@@ -185,7 +185,7 @@ pub enum TimePrecisionMode {
     Connect,
 }
 
-/// TLS mode for connections to MySQL.
+/// TLS mode for connections to `MySQL`.
 #[configurable_component]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -211,13 +211,17 @@ pub enum SslMode {
 ))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "configuration options, each an independent switch"
+)]
 pub struct MysqlCdcConfig {
-    /// The MySQL server host name or IP address.
+    /// The `MySQL` server host name or IP address.
     #[serde(default = "default_hostname")]
     #[configurable(metadata(docs::examples = "mysql.internal"))]
     pub hostname: String,
 
-    /// The MySQL server port.
+    /// The `MySQL` server port.
     #[serde(default = "default_port")]
     pub port: u16,
 
@@ -235,7 +239,7 @@ pub struct MysqlCdcConfig {
 
     /// The replica server ID this source registers with. Must be unique among all replicas
     /// (and other CDC clients) of the server.
-    #[configurable(metadata(docs::examples = 184054))]
+    #[configurable(metadata(docs::examples = 184_054))]
     pub server_id: u32,
 
     /// Logical name of the captured server, emitted as `source.name` (Debezium's `topic.prefix`).
@@ -455,7 +459,7 @@ pub struct MysqlCdcConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     pub connect_timeout_secs: u64,
 
-    /// TLS mode for connections to MySQL.
+    /// TLS mode for connections to `MySQL`.
     #[serde(default)]
     pub ssl_mode: SslMode,
 
@@ -592,7 +596,7 @@ impl MysqlCdcConfig {
 #[typetag::serde(name = "mysql_cdc")]
 impl SourceConfig for MysqlCdcConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
-        source::build(self, cx).await
+        source::build(self, cx)
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {

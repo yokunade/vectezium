@@ -1,9 +1,9 @@
-//! Conversion of MySQL column values into Debezium's JSON representation.
+//! Conversion of `MySQL` column values into Debezium's JSON representation.
 //!
-//! The mapping follows the Debezium MySQL connector with the JSON converter and
+//! The mapping follows the Debezium `MySQL` connector with the JSON converter and
 //! `schemas.enable=false`:
 //!
-//! | MySQL type                    | Output                                                       |
+//! | `MySQL` type                    | Output                                                       |
 //! |-------------------------------|--------------------------------------------------------------|
 //! | integer types                 | number (`BIGINT UNSIGNED` > 2^63-1 wraps, as in Debezium)    |
 //! | `FLOAT` / `DOUBLE`            | number                                                       |
@@ -68,7 +68,7 @@ fn err<T>(column: &ColumnDesc, msg: impl std::fmt::Display) -> Result<T, Convert
 }
 
 /// Represents a `JSON` column value per `json_handling_mode`.
-fn json_document(doc: Json, opts: &ConvertOptions) -> Json {
+fn json_document(doc: Json, opts: ConvertOptions) -> Json {
     match opts.json {
         JsonHandlingMode::String => Json::String(doc.to_string()),
         JsonHandlingMode::Object => doc,
@@ -79,7 +79,7 @@ fn json_document(doc: Json, opts: &ConvertOptions) -> Json {
 pub fn convert_binlog_value(
     column: &ColumnDesc,
     value: &BinlogValue<'_>,
-    opts: &ConvertOptions,
+    opts: ConvertOptions,
 ) -> Result<Json, ConvertError> {
     match value {
         BinlogValue::Value(v) => convert_value(column, v, Origin::Binlog, opts),
@@ -94,12 +94,13 @@ pub fn convert_binlog_value(
     }
 }
 
-/// Converts a plain MySQL value (snapshot rows, or the non-JSON part of binlog rows).
+/// Converts a plain `MySQL` value (snapshot rows, or the non-JSON part of binlog rows).
+#[allow(clippy::too_many_lines, reason = "one arm per MySQL column type")]
 pub fn convert_value(
     column: &ColumnDesc,
     value: &Value,
     origin: Origin,
-    opts: &ConvertOptions,
+    opts: ConvertOptions,
 ) -> Result<Json, ConvertError> {
     if matches!(value, Value::NULL) {
         return Ok(Json::Null);
@@ -195,7 +196,7 @@ pub fn convert_value(
         ColKind::Timestamp => timestamp(column, value, origin),
         ColKind::Bit => {
             let Value::Bytes(bytes) = value else {
-                return err(column, format!("unexpected value {other:?}", other = value));
+                return err(column, format!("unexpected value {value:?}"));
             };
             if column.bit_len == 1 {
                 Ok(Json::Bool(bytes.iter().any(|b| *b != 0)))
@@ -217,7 +218,6 @@ pub fn convert_value(
             other => err(column, format!("unexpected value {other:?}")),
         },
         ColKind::Enum => match (origin, value) {
-            (Origin::Binlog, Value::Int(index)) => Ok(Json::String(enum_value(column, *index))),
             (_, Value::Bytes(bytes)) => Ok(Json::String(decode_text(bytes, column.charset))),
             (_, Value::Int(index)) => Ok(Json::String(enum_value(column, *index))),
             (_, other) => err(column, format!("unexpected value {other:?}")),
@@ -279,7 +279,7 @@ fn integer(column: &ColumnDesc, value: &Value) -> Result<Json, ConvertError> {
         Value::Int(i) => Ok(json!(i)),
         // Like Debezium's default `bigint.unsigned.handling.mode=long`, `BIGINT UNSIGNED`
         // values above i64::MAX wrap around (Vector event values are signed 64-bit integers).
-        Value::UInt(u) => Ok(json!(*u as i64)),
+        Value::UInt(u) => Ok(json!(u.cast_signed())),
         Value::Bytes(b) => {
             let s = parse_str(column, b)?;
             let s = s.trim();
@@ -312,7 +312,7 @@ fn parse_f64(column: &ColumnDesc, bytes: &[u8]) -> Result<f64, ConvertError> {
         .or_else(|_| err(column, "invalid floating point value"))
 }
 
-fn decimal(column: &ColumnDesc, text: &str, opts: &ConvertOptions) -> Result<Json, ConvertError> {
+fn decimal(column: &ColumnDesc, text: &str, opts: ConvertOptions) -> Result<Json, ConvertError> {
     match opts.decimal {
         DecimalHandlingMode::String => Ok(Json::String(text.to_owned())),
         DecimalHandlingMode::Double => text
@@ -368,10 +368,11 @@ pub fn decimal_unscaled_bytes(text: &str) -> Option<Vec<u8>> {
             let q = acc / 256;
             remainder = acc % 256;
             if !quotient.is_empty() || q != 0 {
-                quotient.push(q as u8);
+                // remainder < 256, so acc < 2570 and q <= 10.
+                quotient.push(u8::try_from(q).expect("quotient below 256"));
             }
         }
-        magnitude.push(remainder as u8);
+        magnitude.push(u8::try_from(remainder).expect("remainder below 256"));
         number = quotient;
     }
     magnitude.reverse();
@@ -430,9 +431,10 @@ fn timestamp(column: &ColumnDesc, value: &Value, origin: Origin) -> Result<Json,
             let (secs, frac) = s.split_once('.').unwrap_or((s, "0"));
             let secs: i64 = secs.parse().or_else(|_| err(column, "invalid timestamp"))?;
             let frac = format!("{frac:0<6}");
-            let usecs: i64 = frac[..6]
-                .parse()
-                .or_else(|_| err(column, "invalid timestamp"))?;
+            let usecs: i64 = frac
+                .get(..6)
+                .and_then(|digits| digits.parse().ok())
+                .map_or_else(|| err(column, "invalid timestamp"), Ok)?;
             secs * 1_000_000 + usecs
         }
         (Origin::Binlog, Value::Int(secs)) => secs * 1_000_000,
@@ -458,8 +460,9 @@ pub fn format_zoned_timestamp(micros: i64, fsp: u8) -> String {
     if fsp == 0 {
         format!("{base}Z")
     } else {
-        let frac = format!("{:06}", micros.rem_euclid(1_000_000));
-        format!("{base}.{}Z", &frac[..fsp])
+        let mut frac = format!("{:06}", micros.rem_euclid(1_000_000));
+        frac.truncate(fsp);
+        format!("{base}.{frac}Z")
     }
 }
 
@@ -471,7 +474,8 @@ fn enum_value(column: &ColumnDesc, index: i64) -> String {
     column
         .enum_values
         .as_ref()
-        .and_then(|values| values.get(index as usize - 1))
+        .zip(usize::try_from(index - 1).ok())
+        .and_then(|(values, i)| values.get(i))
         .cloned()
         .unwrap_or_else(|| index.to_string())
 }
@@ -490,7 +494,7 @@ fn set_value(column: &ColumnDesc, bitmap: &[u8]) -> String {
     selected.join(",")
 }
 
-/// MySQL character-set ids that use the latin1 repertoire.
+/// `MySQL` character-set ids that use the latin1 repertoire.
 const LATIN1_CHARSETS: &[u16] = &[5, 8, 15, 31, 47, 48, 49, 94];
 
 pub fn decode_text(bytes: &[u8], charset: u16) -> String {
@@ -568,7 +572,7 @@ mod tests {
                 &col(ColKind::Date),
                 &Value::Date(1970, 1, 2, 0, 0, 0, 0),
                 Origin::Binlog,
-                &o
+                o
             )
             .unwrap(),
             json!(1)
@@ -578,7 +582,7 @@ mod tests {
                 &col(ColKind::Date),
                 &Value::Date(0, 0, 0, 0, 0, 0, 0),
                 Origin::Binlog,
-                &o
+                o
             )
             .unwrap(),
             Json::Null
@@ -587,18 +591,18 @@ mod tests {
         let mut dt = col(ColKind::DateTime);
         let v = Value::Date(2024, 1, 1, 0, 0, 1, 500_000);
         assert_eq!(
-            convert_value(&dt, &v, Origin::Binlog, &o).unwrap(),
+            convert_value(&dt, &v, Origin::Binlog, o).unwrap(),
             json!(1_704_067_201_500_i64)
         );
         dt.fsp = 6;
         assert_eq!(
-            convert_value(&dt, &v, Origin::Binlog, &o).unwrap(),
+            convert_value(&dt, &v, Origin::Binlog, o).unwrap(),
             json!(1_704_067_201_500_000_i64)
         );
 
         let t = Value::Time(true, 1, 2, 0, 0, 5);
         assert_eq!(
-            convert_value(&col(ColKind::Time), &t, Origin::Binlog, &o).unwrap(),
+            convert_value(&col(ColKind::Time), &t, Origin::Binlog, o).unwrap(),
             json!(-(26_i64 * 3600 * 1_000_000 + 5))
         );
 
@@ -609,7 +613,7 @@ mod tests {
                 &ts,
                 &Value::Bytes(b"1704067200.123456".to_vec()),
                 Origin::Binlog,
-                &o
+                o
             )
             .unwrap(),
             json!("2024-01-01T00:00:00.123Z")
@@ -620,7 +624,7 @@ mod tests {
                 &ts,
                 &Value::Date(2024, 1, 1, 0, 0, 0, 0),
                 Origin::Snapshot,
-                &o
+                o
             )
             .unwrap(),
             json!("2024-01-01T00:00:00Z")
@@ -633,30 +637,30 @@ mod tests {
         let mut bit = col(ColKind::Bit);
         bit.bit_len = 1;
         assert_eq!(
-            convert_value(&bit, &Value::Bytes(vec![1]), Origin::Binlog, &o).unwrap(),
+            convert_value(&bit, &Value::Bytes(vec![1]), Origin::Binlog, o).unwrap(),
             json!(true)
         );
         bit.bit_len = 16;
         assert_eq!(
-            convert_value(&bit, &Value::Bytes(vec![0x01, 0x02]), Origin::Binlog, &o).unwrap(),
+            convert_value(&bit, &Value::Bytes(vec![0x01, 0x02]), Origin::Binlog, o).unwrap(),
             json!(BASE64_STANDARD.encode([0x02, 0x01]))
         );
 
         let mut e = col(ColKind::Enum);
-        e.enum_values = Some(Arc::new(vec!["a".into(), "b".into()]));
+        e.enum_values = Some(Arc::from(vec!["a".into(), "b".into()]));
         assert_eq!(
-            convert_value(&e, &Value::Int(2), Origin::Binlog, &o).unwrap(),
+            convert_value(&e, &Value::Int(2), Origin::Binlog, o).unwrap(),
             json!("b")
         );
         assert_eq!(
-            convert_value(&e, &Value::Bytes(b"a".to_vec()), Origin::Snapshot, &o).unwrap(),
+            convert_value(&e, &Value::Bytes(b"a".to_vec()), Origin::Snapshot, o).unwrap(),
             json!("a")
         );
 
         let mut s = col(ColKind::Set);
-        s.set_values = Some(Arc::new(vec!["x".into(), "y".into(), "z".into()]));
+        s.set_values = Some(Arc::from(vec!["x".into(), "y".into(), "z".into()]));
         assert_eq!(
-            convert_value(&s, &Value::Bytes(vec![0b101]), Origin::Binlog, &o).unwrap(),
+            convert_value(&s, &Value::Bytes(vec![0b101]), Origin::Binlog, o).unwrap(),
             json!("x,z")
         );
     }
@@ -669,7 +673,7 @@ mod tests {
                 &col(ColKind::String),
                 &Value::Bytes("héllo".as_bytes().to_vec()),
                 Origin::Binlog,
-                &o
+                o
             )
             .unwrap(),
             json!("héllo")
@@ -677,13 +681,13 @@ mod tests {
         let mut latin1 = col(ColKind::String);
         latin1.charset = 8;
         assert_eq!(
-            convert_value(&latin1, &Value::Bytes(vec![0x68, 0xE9]), Origin::Binlog, &o).unwrap(),
+            convert_value(&latin1, &Value::Bytes(vec![0x68, 0xE9]), Origin::Binlog, o).unwrap(),
             json!("hé")
         );
         let mut bin = col(ColKind::String);
         bin.charset = 63;
         assert_eq!(
-            convert_value(&bin, &Value::Bytes(vec![0xDE, 0xAD]), Origin::Binlog, &o).unwrap(),
+            convert_value(&bin, &Value::Bytes(vec![0xDE, 0xAD]), Origin::Binlog, o).unwrap(),
             json!("3q0=")
         );
     }
@@ -696,29 +700,29 @@ mod tests {
                 &col(ColKind::BigInt),
                 &Value::UInt(u64::MAX),
                 Origin::Binlog,
-                &o
+                o
             )
             .unwrap(),
             json!(-1)
         );
         assert_eq!(
-            convert_value(&col(ColKind::Float), &Value::Float(0.1), Origin::Binlog, &o).unwrap(),
+            convert_value(&col(ColKind::Float), &Value::Float(0.1), Origin::Binlog, o).unwrap(),
             json!(0.1)
         );
         let dec = Value::Bytes(b"-12.50".to_vec());
         assert_eq!(
-            convert_value(&col(ColKind::Decimal), &dec, Origin::Binlog, &o).unwrap(),
+            convert_value(&col(ColKind::Decimal), &dec, Origin::Binlog, o).unwrap(),
             json!("-12.50")
         );
         o.decimal = DecimalHandlingMode::Double;
         assert_eq!(
-            convert_value(&col(ColKind::Decimal), &dec, Origin::Binlog, &o).unwrap(),
+            convert_value(&col(ColKind::Decimal), &dec, Origin::Binlog, o).unwrap(),
             json!(-12.5)
         );
         o.decimal = DecimalHandlingMode::Precise;
         // -1250 => 0xFB1E
         assert_eq!(
-            convert_value(&col(ColKind::Decimal), &dec, Origin::Binlog, &o).unwrap(),
+            convert_value(&col(ColKind::Decimal), &dec, Origin::Binlog, o).unwrap(),
             json!(BASE64_STANDARD.encode([0xFB, 0x1E]))
         );
     }
@@ -733,7 +737,7 @@ mod tests {
                 &col(ColKind::Geometry),
                 &Value::Bytes(bytes),
                 Origin::Binlog,
-                &o
+                o
             )
             .unwrap(),
             json!({"wkb": BASE64_STANDARD.encode([1, 2, 3]), "srid": 4326})

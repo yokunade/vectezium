@@ -1,7 +1,7 @@
 //! Incremental (chunked) snapshots, read while the binlog streams.
 //!
-//! This is the read-only variant of the DBLog watermark algorithm (as in Debezium's read-only
-//! incremental snapshots for MySQL). Each chunk of a table is read with one short query, in key
+//! This is the read-only variant of the `DBLog` watermark algorithm (as in Debezium's read-only
+//! incremental snapshots for `MySQL`). Each chunk of a table is read with one short query, in key
 //! order, bracketed by two reads of `@@GLOBAL.gtid_executed`:
 //!
 //! * `low`: executed before the chunk was read;
@@ -20,6 +20,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    fmt::Write as _,
     sync::Arc,
 };
 
@@ -366,7 +367,7 @@ impl Incremental {
                     info!(
                         message = "Incremental snapshot: reading table.",
                         table = %format!("{database}.{table}"),
-                        snapshot_id = %self.progress.as_ref().map(|p| p.snapshot_id.as_str()).unwrap_or(""),
+                        snapshot_id = %self.progress.as_ref().map_or("", |p| p.snapshot_id.as_str()),
                         internal_log_rate_limit = false,
                     );
                 }
@@ -439,6 +440,10 @@ async fn key_columns(
 }
 
 /// Reads one chunk. `Ok(None)` when there is nothing to do.
+#[allow(
+    clippy::too_many_lines,
+    reason = "query, watermark check and emit kept together, in order"
+)]
 async fn read(
     conn: &mut Conn,
     settings: &Settings,
@@ -485,10 +490,10 @@ async fn read(
                 "the key changed since the snapshot started; snapshot it again".into(),
             ));
         }
-        query.push_str(&format!(" WHERE ({key_list}) > ({})", last.join(", ")));
+        write!(query, " WHERE ({key_list}) > ({})", last.join(", ")).expect("writing to a String");
     }
     let limit = settings.incremental_chunk_size;
-    query.push_str(&format!(" ORDER BY {key_list} LIMIT {limit}"));
+    write!(query, " ORDER BY {key_list} LIMIT {limit}").expect("writing to a String");
 
     let low = gtid_executed(conn).await?;
     let mut result = conn
@@ -504,7 +509,7 @@ async fn read(
         &result_columns,
         &details,
         &settings.filters,
-        &settings.convert,
+        settings.convert,
     ));
     let key_index: Vec<usize> = keys
         .iter()
@@ -534,7 +539,7 @@ async fn read(
             return Err(ReadError::Fail("a key value is missing from a row".into()));
         };
         last = Some(literals);
-        match convert_row(&info, row, &settings.convert) {
+        match convert_row(&info, row, settings.convert) {
             Ok((after, key)) => {
                 let key_text = key.as_ref().map(key_string).unwrap_or_default();
                 let event = build_read(&builder, &settings.topic_prefix, "", 0, &info, after, key);

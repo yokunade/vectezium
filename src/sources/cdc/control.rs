@@ -42,6 +42,7 @@ pub fn snapshot_completed(
 /// The `snapshot_held` control event: the table needs a snapshot nobody asked for, and
 /// `unplanned_snapshots` is `hold`, so its changes are streamed but its existing rows are not
 /// read until an operator queues it. Emitted at every start while the table is held.
+#[must_use]
 pub fn snapshot_held(
     server_name: &str,
     database: &str,

@@ -43,6 +43,7 @@ fn new_snapshot_id() -> String {
 }
 
 /// Takes the snapshot. Returns the offset to stream from, or `None` if the source was shut down.
+#[allow(clippy::too_many_lines, reason = "the snapshot's phases in order")]
 pub(super) async fn run(
     settings: Arc<Settings>,
     query: &Client,

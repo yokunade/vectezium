@@ -82,6 +82,10 @@ struct Touched {
     keys: Vec<String>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the streaming loop's inputs, each used throughout"
+)]
 pub(super) async fn stream(
     settings: &Settings,
     query: Client,
@@ -206,7 +210,7 @@ async fn session(
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The server sends keepalives at half its `wal_sender_timeout`; silence for much longer means
     // the connection is gone.
-    let silence = interval * 3 + Duration::from_secs(60);
+    let silence = interval * 3 + Duration::from_mins(1);
     if let Some(end) = open_window(state, replication).await? {
         return Ok(end);
     }
@@ -270,7 +274,7 @@ async fn session(
     }
 }
 
-fn ts_us(pg_micros: i64) -> i64 {
+const fn ts_us(pg_micros: i64) -> i64 {
     pg_micros + PG_EPOCH_OFFSET_US
 }
 
@@ -278,6 +282,7 @@ fn timestamp(ts_us: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_micros(ts_us).unwrap_or_else(Utc::now)
 }
 
+#[allow(clippy::too_many_lines, reason = "one arm per pgoutput message type")]
 async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Result<(), String> {
     match message {
         M::Begin(begin) => {
@@ -310,7 +315,7 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
                 .map(|c| {
                     Ok(RelationColumn {
                         name: c.name().map_err(|e| e.to_string())?.to_owned(),
-                        type_oid: c.type_id() as u32,
+                        type_oid: c.type_id().cast_unsigned(),
                         typmod: c.type_modifier(),
                     })
                 })
@@ -419,7 +424,6 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
             }
         }
         // Replication origins, logical decoding messages and type descriptions are not needed.
-        M::Origin(_) | M::Message(_) | M::Type(_) => {}
         _ => {}
     }
     Ok(())
@@ -502,7 +506,7 @@ fn schema_change(state: &State<'_>, emitter: &mut Emitter, previous: &TableInfo,
     );
 }
 
-/// The text of a tuple's column `i` (`Ok(None)` for SQL NULL); an unchanged TOASTed value is
+/// The text of a tuple's column `i` (`Ok(None)` for SQL NULL); an unchanged `TOASTed` value is
 /// taken from `old` when it has it, else the placeholder.
 fn column_text<'t>(
     tuple: &'t Tuple,
@@ -531,7 +535,7 @@ fn column_text<'t>(
 }
 
 /// Converts a tuple to a row. `key_only` keeps only the key columns (a key tuple). Unchanged
-/// TOASTed columns are written as the placeholder string, bypassing conversion.
+/// `TOASTed` columns are written as the placeholder string, bypassing conversion.
 fn tuple_row(
     settings: &Settings,
     info: &TableInfo,
@@ -813,7 +817,7 @@ async fn open_window(
 /// Emits the open window's remaining rows once the stream has reached its high watermark
 /// (`position`: everything committed before it has been streamed), and records the progress.
 fn close_window(state: &mut State<'_>, emitter: &mut Emitter, position: Lsn) {
-    if !state.window.as_ref().is_some_and(|w| position >= w.high) {
+    if state.window.as_ref().is_none_or(|w| position < w.high) {
         return;
     }
     let window = *state.window.take().expect("window is open");
@@ -829,12 +833,12 @@ fn close_window(state: &mut State<'_>, emitter: &mut Emitter, position: Lsn) {
         window.high,
         window.complete,
     );
-    progress.last_key = window.last_key.clone();
+    progress.last_key.clone_from(&window.last_key);
 
     note_table_schema(emitter, state.settings, &info, "snapshot", Some(high));
     let builder = emitter.builder();
     let now = Utc::now();
-    let mut emitted = 0;
+    let mut count = 0;
     for after in window.into_rows() {
         let source = state.settings.source_info(
             &info,
@@ -847,10 +851,10 @@ fn close_window(state: &mut State<'_>, emitter: &mut Emitter, position: Lsn) {
         let mut event = row_event(&builder, &info, Op::Read, None, Some(after), &source, now);
         builder.set_snapshot_id(&mut event, &snapshot_id);
         emitter.push_snapshot_row(event);
-        emitted += 1;
+        count += 1;
     }
     let progress = state.offset.incremental.as_mut().expect("checked above");
-    progress.rows += emitted;
+    progress.rows += count;
     if complete {
         let rows = progress.rows;
         if state.settings.snapshot_end_markers {

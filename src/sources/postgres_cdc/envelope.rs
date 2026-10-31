@@ -12,7 +12,7 @@
 //!
 //! As in Debezium, `source.db` is the database and `source.schema` the schema. In the record
 //! format `metadata.db` is the schema (the level the include lists and the lake layout use, as
-//! the database is for MySQL), with the database in `metadata.database`.
+//! the database is for `MySQL`), with the database in `metadata.database`.
 
 use serde_json::{Map, Value as Json, json};
 

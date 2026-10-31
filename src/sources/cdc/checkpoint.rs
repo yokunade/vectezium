@@ -58,7 +58,7 @@ pub trait CdcOffset:
     fn snapshot_in_progress(&self) -> bool;
 
     /// Adds the connector's position fields to a published offset (for example `gtid_set`,
-    /// `file`, `pos` for MySQL; `lsn` for PostgreSQL).
+    /// `file`, `pos` for `MySQL`; `lsn` for PostgreSQL).
     fn publish_position(&self, payload: &mut Map<String, Json>);
 
     /// Whether this offset should be published although its `seq` equals that of `published`:
@@ -78,6 +78,7 @@ pub struct CheckpointStore<O> {
 }
 
 impl<O: CdcOffset> CheckpointStore<O> {
+    #[must_use]
     pub fn new(data_dir: &Path) -> Self {
         Self {
             path: data_dir.join(CHECKPOINT_FILENAME),
@@ -86,11 +87,16 @@ impl<O: CdcOffset> CheckpointStore<O> {
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Loads the stored offset, if any.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read, or with `InvalidData` if it does not hold an offset.
     pub async fn load(&self) -> std::io::Result<Option<O>> {
         match tokio::fs::read(&self.path).await {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Ok(None),
@@ -106,6 +112,11 @@ impl<O: CdcOffset> CheckpointStore<O> {
     }
 
     /// Atomically replaces the stored offset (write temp file, fsync, rename, fsync directory).
+    ///
+    /// # Errors
+    ///
+    /// Fails if any step of the write, rename or sync fails; the previous offset then stays
+    /// in place.
     pub async fn store(&self, offset: &O) -> std::io::Result<()> {
         let mut bytes = serde_json::to_vec_pretty(offset)?;
         bytes.push(b'\n');
@@ -129,6 +140,10 @@ impl<O: CdcOffset> CheckpointStore<O> {
 
 /// Checks the delivery settings every connector shares; warns when offsets can run ahead of
 /// delivered data.
+///
+/// # Errors
+///
+/// Fails if `publish_offsets` is set without end-to-end acknowledgements.
 pub fn check_acknowledgements(
     source_type: &str,
     acknowledgements: bool,
@@ -301,6 +316,10 @@ impl OffsetPublisher {
 /// Coalesces offsets and writes the newest one at most once per interval; publishes stored
 /// offsets (at most once per publish interval) when `publish_offsets` is on. Writes and
 /// publishes nothing while `guard` says this instance may not write.
+#[allow(
+    clippy::similar_names,
+    reason = "`publisher` publishes offsets; `published` is the last offset it published"
+)]
 async fn checkpoint_writer<O: CdcOffset>(
     mut rx: mpsc::UnboundedReceiver<O>,
     store: CheckpointStore<O>,

@@ -112,6 +112,11 @@ impl SingleWriterLockConfig {
     }
 
     /// Checks the settings and builds the client (no I/O).
+    ///
+    /// # Errors
+    ///
+    /// Fails if the lease duration is out of range, the blob name is empty, or the storage
+    /// settings do not name exactly one way to reach the account.
     pub fn build(&self, proxy: &ProxyConfig) -> Result<LockClient, String> {
         if !(MIN_LEASE_SECS..=MAX_LEASE_SECS).contains(&self.lease_duration_secs) {
             return Err(format!(
@@ -153,11 +158,13 @@ pub struct LockClient {
 impl LockClient {
     /// The container holding the lock blob, for reading the connector's other blobs
     /// (`offset_recovery`).
+    #[must_use]
     pub fn container(&self) -> Arc<BlobContainerClient> {
         Arc::clone(&self.container)
     }
 
     /// The lock blob's name inside the container.
+    #[must_use]
     pub fn blob_name(&self) -> &str {
         &self.blob_name
     }
@@ -178,17 +185,20 @@ struct LeaseState {
 
 impl WriterGuard {
     /// A guard that always allows writes (no lock configured).
+    #[must_use]
     pub fn unlocked() -> Self {
         Self {
             state: Arc::new(LeaseState {
                 fenced: AtomicBool::new(false),
-                valid_until: std::sync::Mutex::new(
-                    Instant::now() + Duration::from_secs(10 * 365 * 86_400),
-                ),
+                valid_until: std::sync::Mutex::new(Instant::now() + Duration::from_hours(87600)),
             }),
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if the lease mutex was poisoned by a thread that panicked while holding it.
+    #[must_use]
     pub fn may_write(&self) -> bool {
         !self.state.fenced.load(Ordering::SeqCst)
             && Instant::now() < *self.state.valid_until.lock().expect("lock poisoned")
@@ -218,6 +228,11 @@ fn safety_margin(duration: Duration) -> Duration {
 
 impl LockClient {
     /// Waits for the lease. Returns `None` if shutdown is requested first.
+    ///
+    /// # Errors
+    ///
+    /// Does not fail today: storage errors are logged and retried until the lease is taken
+    /// or shutdown is requested.
     pub async fn acquire(self, mut shutdown: ShutdownSignal) -> Result<Option<HeldLock>, String> {
         let lease_id = uuid::Uuid::new_v4().to_string();
         let seconds = i32::try_from(self.duration.as_secs()).unwrap_or(60);
@@ -240,7 +255,11 @@ impl LockClient {
                         state: Arc::new(LeaseState {
                             fenced: AtomicBool::new(false),
                             valid_until: std::sync::Mutex::new(
-                                requested + self.duration - safety_margin(self.duration),
+                                (requested + self.duration)
+                                    .checked_sub(safety_margin(self.duration))
+                                    // Cannot underflow (the margin is a third of the duration);
+                                    // if it did, treat the lease as already lapsed.
+                                    .unwrap_or(requested),
                             ),
                         }),
                     };
@@ -320,7 +339,7 @@ async fn renew(
         let result = tokio::time::timeout(interval, blob.renew_lease(lease_id.clone(), None)).await;
         match result {
             Ok(Ok(_)) => {
-                guard.extend(requested + duration - margin);
+                guard.extend((requested + duration).checked_sub(margin).unwrap());
                 next = requested + interval;
                 continue;
             }
@@ -360,6 +379,7 @@ async fn renew(
 }
 
 impl HeldLock {
+    #[must_use]
     pub fn guard(&self) -> WriterGuard {
         self.guard.clone()
     }
@@ -397,6 +417,10 @@ const LOCK_RELEASE_WAIT: Duration = Duration::from_secs(10);
 /// starts (so before the stored offset is read), stops `run` if the lock is lost, and releases
 /// the lock once the last offset is written (`run` fires the `oneshot` sender after its last
 /// write; see `Checkpoints::start`).
+///
+/// # Errors
+///
+/// Returns the error of `run`, or fails if the lock is lost while `run` is running.
 pub async fn run_locked<F, Fut>(
     lock: Option<LockClient>,
     shutdown: ShutdownSignal,
@@ -465,7 +489,11 @@ mod tests {
     fn guard_fences_on_expiry_and_release() {
         let guard = WriterGuard::unlocked();
         assert!(guard.may_write());
-        guard.extend(Instant::now() - Duration::from_millis(1));
+        guard.extend(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
+        );
         assert!(!guard.may_write(), "expired lease must stop writes");
         guard.extend(Instant::now() + Duration::from_secs(10));
         assert!(guard.may_write());

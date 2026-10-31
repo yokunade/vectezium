@@ -52,6 +52,10 @@ pub const CONNECTOR_VERSION: &str = concat!("vector-postgres_cdc-", env!("CARGO_
 pub(super) type Emitter = crate::sources::cdc::emitter::Emitter<Offset>;
 
 /// Static settings shared by the snapshot and streaming phases.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "settings derived from independent configuration options"
+)]
 pub(super) struct Settings {
     pub conn: ConnectionSettings,
     pub database: String,
@@ -93,8 +97,7 @@ impl Settings {
         let first = self
             .warned_no_key
             .lock()
-            .map(|mut warned| warned.insert(name.clone()))
-            .unwrap_or(false);
+            .is_ok_and(|mut warned| warned.insert(name.clone()));
         if first {
             warn!(
                 message = "Table has no primary key; its change events carry no key, so a downstream \
@@ -241,7 +244,11 @@ pub(super) fn note_table_schema(
     });
 }
 
-pub(super) async fn build(config: &PostgresCdcConfig, cx: SourceContext) -> crate::Result<Source> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates the config and wires the source together"
+)]
+pub(super) fn build(config: &PostgresCdcConfig, cx: SourceContext) -> crate::Result<Source> {
     if config.database.is_empty() {
         return Err("`database` must name the database to capture".into());
     }
@@ -323,7 +330,7 @@ pub(super) async fn build(config: &PostgresCdcConfig, cx: SourceContext) -> crat
             .publish_offsets
             .then(|| Duration::from_secs(config.offset_publish_interval_secs.max(1))),
         status_interval: Duration::from_secs(config.status_update_interval_secs.max(1)),
-        warned_no_key: Default::default(),
+        warned_no_key: Mutex::default(),
     };
 
     let acknowledgements = cx.do_acknowledgements(config.acknowledgements);
@@ -630,7 +637,11 @@ pub(super) async fn drop_slot(client: &Client, settings: &Settings) -> Result<()
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the source's lifecycle: recover, snapshot, stream"
+)]
 async fn run(
     settings: Arc<Settings>,
     data_dir: PathBuf,
@@ -813,75 +824,75 @@ async fn run(
         None => None,
     };
 
-    let start = match resume {
-        Some(offset) => offset,
-        None => {
-            // Starting over: a leftover slot cannot give a snapshot, so it is replaced.
-            if slot != SlotState::Missing {
-                info!(message = "Dropping the replication slot to create it again with a snapshot.", slot = %settings.slot_name);
-                drop_slot(&query, &settings).await?;
+    let start = if let Some(offset) = resume {
+        offset
+    } else {
+        // Starting over: a leftover slot cannot give a snapshot, so it is replaced.
+        if slot != SlotState::Missing {
+            info!(message = "Dropping the replication slot to create it again with a snapshot.", slot = %settings.slot_name);
+            drop_slot(&query, &settings).await?;
+        }
+        let snapshotting = stored.is_some() || settings.snapshot_mode != SnapshotMode::NoData;
+        if snapshotting && settings.snapshot_strategy == SnapshotStrategy::Blocking {
+            let completed = snapshot::run(
+                Arc::clone(&settings),
+                &query,
+                &registry,
+                &mut emitter,
+                &captured,
+                &system_id,
+                shutdown.clone(),
+            )
+            .await?;
+            let Some(offset) = completed else {
+                // Shut down mid-snapshot; it is taken again on the next start.
+                return emitter.close().await;
+            };
+            if settings.snapshot_mode == SnapshotMode::InitialOnly {
+                info!(
+                    message =
+                        "Snapshot complete; `snapshot_mode` is `initial_only`, so not streaming."
+                );
+                return emitter.close().await;
             }
-            let snapshotting = stored.is_some() || settings.snapshot_mode != SnapshotMode::NoData;
-            if snapshotting && settings.snapshot_strategy == SnapshotStrategy::Blocking {
-                let completed = snapshot::run(
-                    Arc::clone(&settings),
-                    &query,
-                    &registry,
-                    &mut emitter,
-                    &captured,
-                    &system_id,
-                    shutdown.clone(),
+            offset
+        } else {
+            // An incremental snapshot (read while streaming), or `no_data` (existing rows are
+            // deliberately not captured): stream from the slot's position right away.
+            let repl = settings.conn.connect(true).await?;
+            let created = simple_rows(
+                &repl,
+                &format!(
+                    "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+                    quote_ident(&settings.slot_name)
+                ),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to create replication slot `{}`: {}",
+                    settings.slot_name,
+                    error_text(&error)
                 )
-                .await?;
-                let Some(offset) = completed else {
-                    // Shut down mid-snapshot; it is taken again on the next start.
-                    return emitter.close().await;
-                };
-                if settings.snapshot_mode == SnapshotMode::InitialOnly {
-                    info!(
-                        message = "Snapshot complete; `snapshot_mode` is `initial_only`, so not streaming."
-                    );
-                    return emitter.close().await;
-                }
-                offset
+            })?;
+            let lsn: Lsn = created
+                .first()
+                .and_then(|row| row.get(1).cloned().flatten())
+                .ok_or("CREATE_REPLICATION_SLOT returned no position")?
+                .parse()?;
+            let mut offset = Offset::new(lsn, &settings.slot_name, Some(system_id.clone()));
+            offset.snapshot_completed = true;
+            if snapshotting {
+                info!(message = "Created the replication slot; snapshotting tables incrementally while streaming.", offset = %offset, tables = captured.len());
+                offset.incremental =
+                    (!captured.is_empty()).then(|| IncrementalProgress::new(captured.clone()));
             } else {
-                // An incremental snapshot (read while streaming), or `no_data` (existing rows are
-                // deliberately not captured): stream from the slot's position right away.
-                let repl = settings.conn.connect(true).await?;
-                let created = simple_rows(
-                    &repl,
-                    &format!(
-                        "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
-                        quote_ident(&settings.slot_name)
-                    ),
-                )
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to create replication slot `{}`: {}",
-                        settings.slot_name,
-                        error_text(&error)
-                    )
-                })?;
-                let lsn: Lsn = created
-                    .first()
-                    .and_then(|row| row.get(1).cloned().flatten())
-                    .ok_or("CREATE_REPLICATION_SLOT returned no position")?
-                    .parse()?;
-                let mut offset = Offset::new(lsn, &settings.slot_name, Some(system_id.clone()));
-                offset.snapshot_completed = true;
-                if snapshotting {
-                    info!(message = "Created the replication slot; snapshotting tables incrementally while streaming.", offset = %offset, tables = captured.len());
-                    offset.incremental =
-                        (!captured.is_empty()).then(|| IncrementalProgress::new(captured.clone()));
-                } else {
-                    info!(message = "Created the replication slot; streaming without a snapshot.", offset = %offset);
-                    offset.snapshotted_tables = captured.clone();
-                }
-                emitter.commit(offset.clone());
-                emitter.flush().await?;
-                offset
+                info!(message = "Created the replication slot; streaming without a snapshot.", offset = %offset);
+                offset.snapshotted_tables = captured.clone();
             }
+            emitter.commit(offset.clone());
+            emitter.flush().await?;
+            offset
         }
     };
 

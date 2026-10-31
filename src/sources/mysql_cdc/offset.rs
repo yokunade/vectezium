@@ -1,5 +1,5 @@
 //! Binlog offsets and GTID-set bookkeeping. Storage, checkpointing and publishing are shared
-//! by every connector (`cdc::checkpoint`); [`Offset`] is MySQL's [`CdcOffset`].
+//! by every connector (`cdc::checkpoint`); [`Offset`] is `MySQL`'s [`CdcOffset`].
 //!
 //! An [`Offset`] always points at a transaction boundary: the binlog position *after* the last
 //! fully processed transaction, plus the GTID set executed up to and including that transaction.
@@ -17,7 +17,7 @@ pub use crate::sources::cdc::checkpoint::{CHECKPOINT_FILENAME, CheckpointStore};
 /// Current on-disk checkpoint format version.
 const CHECKPOINT_VERSION: u32 = 1;
 
-/// A resumable position in the MySQL binlog.
+/// A resumable position in the `MySQL` binlog.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Offset {
     /// Checkpoint format version.
@@ -102,7 +102,7 @@ const fn default_version() -> u32 {
 }
 
 impl Offset {
-    pub fn new(
+    pub const fn new(
         server_uuid: Option<String>,
         file: String,
         pos: u64,
@@ -219,7 +219,7 @@ impl fmt::Display for Offset {
 /// Intervals are stored inclusive and kept merged so the textual form stays compact.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GtidSet {
-    /// Keyed by `uuid` (lowercase) or `uuid:tag` for tagged GTIDs (MySQL 8.4+).
+    /// Keyed by `uuid` (lowercase) or `uuid:tag` for tagged GTIDs (`MySQL` 8.4+).
     sets: BTreeMap<String, Vec<(u64, u64)>>,
 }
 
@@ -298,12 +298,11 @@ impl FromStr for GtidSet {
                     key = format!("{uuid}:{part}");
                     continue;
                 }
-                let (start, end) = match part.split_once('-') {
-                    Some((a, b)) => (parse_gno(a, entry)?, parse_gno(b, entry)?),
-                    None => {
-                        let n = parse_gno(part, entry)?;
-                        (n, n)
-                    }
+                let (start, end) = if let Some((a, b)) = part.split_once('-') {
+                    (parse_gno(a, entry)?, parse_gno(b, entry)?)
+                } else {
+                    let n = parse_gno(part, entry)?;
+                    (n, n)
                 };
                 if start == 0 || end < start {
                     return Err(format!("invalid GTID interval {part:?} in {entry:?}"));

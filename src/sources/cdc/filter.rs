@@ -8,7 +8,7 @@
 //! exclude lists of the same kind are mutually exclusive. The connector's system databases
 //! ([`Filters::with_system_databases`]) are always excluded.
 //!
-//! "Database" is whatever the connector's first name level is (a MySQL database, a PostgreSQL or
+//! "Database" is whatever the connector's first name level is (a `MySQL` database, a PostgreSQL or
 //! SQL Server schema).
 
 use std::{collections::HashMap, sync::Arc};
@@ -32,6 +32,7 @@ pub struct Filters {
 
 /// Whether `table` is a shadow table of gh-ost (`_t_gho`, `_t_ghc`, `_t_del`) or
 /// pt-online-schema-change (`_t_new`, `_t_old`).
+#[must_use]
 pub fn is_online_schema_change_table(table: &str) -> bool {
     let Some(rest) = table.strip_prefix('_') else {
         return false;
@@ -52,6 +53,13 @@ fn build(patterns: &[String], what: &str) -> Result<Option<RegexSet>, String> {
 }
 
 impl Filters {
+    /// Builds the filters from the include and exclude lists (regular expressions, matched in
+    /// full).
+    ///
+    /// # Errors
+    ///
+    /// Fails if both an include and an exclude list are set for databases or tables, or if a
+    /// pattern is not a valid regular expression.
     pub fn new(
         database_include: &[String],
         database_exclude: &[String],
@@ -81,14 +89,14 @@ impl Filters {
 
     /// Databases that are never captured, whatever the lists say (compared case-insensitively).
     #[must_use]
-    pub fn with_system_databases(mut self, databases: &'static [&'static str]) -> Self {
+    pub const fn with_system_databases(mut self, databases: &'static [&'static str]) -> Self {
         self.system_databases = databases;
         self
     }
 
     /// Skips online schema-change shadow tables (see [`is_online_schema_change_table`]).
     #[must_use]
-    pub fn excluding_online_schema_change_tables(mut self, exclude: bool) -> Self {
+    pub const fn excluding_online_schema_change_tables(mut self, exclude: bool) -> Self {
         self.exclude_osc_tables = exclude;
         self
     }
@@ -107,6 +115,7 @@ impl Filters {
             .map(Vec::as_slice)
     }
 
+    #[must_use]
     pub fn database_included(&self, database: &str) -> bool {
         if self
             .system_databases
@@ -124,6 +133,7 @@ impl Filters {
         true
     }
 
+    #[must_use]
     pub fn table_included(&self, database: &str, table: &str) -> bool {
         if !self.database_included(database) {
             return false;
@@ -141,6 +151,7 @@ impl Filters {
         true
     }
 
+    #[must_use]
     pub fn column_excluded(&self, database: &str, table: &str, column: &str) -> bool {
         self.column_exclude
             .as_ref()

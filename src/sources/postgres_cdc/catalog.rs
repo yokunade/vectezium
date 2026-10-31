@@ -192,7 +192,7 @@ fn builtin(oid: u32) -> Option<Kind> {
     })
 }
 
-fn builtin_name(oid: u32) -> Option<&'static str> {
+const fn builtin_name(oid: u32) -> Option<&'static str> {
     Some(match oid {
         16 => "bool",
         21 => "int2",
@@ -317,7 +317,9 @@ async fn read_table(
             type_oid: row.get(3),
             typmod: row.get(4),
             not_null: row.get(5),
-            pk_position: row.get::<_, Option<i32>>(6).map(|p| p as usize),
+            pk_position: row
+                .get::<_, Option<i32>>(6)
+                .and_then(|p| usize::try_from(p).ok()),
         })
         .collect();
     Ok(Some((
@@ -402,20 +404,19 @@ impl TableInfo {
                 }
             })
             .collect();
-        let key: Vec<usize> = match filters.key_columns(schema, table) {
-            Some(names) => names
+        let key: Vec<usize> = if let Some(names) = filters.key_columns(schema, table) {
+            names
                 .iter()
                 .filter_map(|n| columns.iter().position(|c| &c.name == n))
-                .collect(),
-            None => {
-                let mut pk: Vec<(usize, usize)> = columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.primary_key.map(|p| (p, i)))
-                    .collect();
-                pk.sort_unstable();
-                pk.into_iter().map(|(_, i)| i).collect()
-            }
+                .collect()
+        } else {
+            let mut pk: Vec<(usize, usize)> = columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.primary_key.map(|p| (p, i)))
+                .collect();
+            pk.sort_unstable();
+            pk.into_iter().map(|(_, i)| i).collect()
         };
         let schema_core = table_schema::core(schema, table, &columns, &key, convert);
         let schema_version = table_schema::version(&schema_core);

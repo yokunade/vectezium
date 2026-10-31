@@ -1,4 +1,4 @@
-//! Column descriptions used to convert MySQL values into Debezium's representation.
+//! Column descriptions used to convert `MySQL` values into Debezium's representation.
 //!
 //! Descriptions come from two places:
 //!
@@ -25,10 +25,10 @@ use super::{
     table_schema,
 };
 
-/// MySQL's `binary` character set; columns using it hold raw bytes.
+/// `MySQL`'s `binary` character set; columns using it hold raw bytes.
 pub const BINARY_CHARSET: u16 = 63;
 
-/// MySQL's `utf8mb4_0900_ai_ci` collation id.
+/// `MySQL`'s `utf8mb4_0900_ai_ci` collation id.
 pub const UTF8MB4_CHARSET: u16 = 255;
 
 /// Normalized column kind.
@@ -59,8 +59,17 @@ pub enum ColKind {
 }
 
 impl ColKind {
-    pub fn from_column_type(column_type: ColumnType) -> Self {
-        use ColumnType::*;
+    pub const fn from_column_type(column_type: ColumnType) -> Self {
+        use ColumnType::{
+            MYSQL_TYPE_BIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME,
+            MYSQL_TYPE_DATETIME2, MYSQL_TYPE_DECIMAL, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_ENUM,
+            MYSQL_TYPE_FLOAT, MYSQL_TYPE_GEOMETRY, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON,
+            MYSQL_TYPE_LONG, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_MEDIUM_BLOB,
+            MYSQL_TYPE_NEWDATE, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_SET, MYSQL_TYPE_SHORT,
+            MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIME2, MYSQL_TYPE_TIMESTAMP,
+            MYSQL_TYPE_TIMESTAMP2, MYSQL_TYPE_TINY, MYSQL_TYPE_TINY_BLOB, MYSQL_TYPE_VAR_STRING,
+            MYSQL_TYPE_VARCHAR, MYSQL_TYPE_VECTOR, MYSQL_TYPE_YEAR,
+        };
         match column_type {
             MYSQL_TYPE_TINY => Self::TinyInt,
             MYSQL_TYPE_SHORT => Self::SmallInt,
@@ -95,12 +104,16 @@ impl ColKind {
 
 /// Everything needed to convert one column's values.
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about a column, as MySQL reports them"
+)]
 pub struct ColumnDesc {
     pub name: String,
     /// 1-based ordinal position in the table.
     pub position: u32,
     pub kind: ColKind,
-    /// Normalized MySQL type name (`int`, `varchar`, `text`, `blob`, `datetime`, …).
+    /// Normalized `MySQL` type name (`int`, `varchar`, `text`, `blob`, `datetime`, …).
     pub mysql_type: &'static str,
     pub nullable: bool,
     /// Only meaningful for integer, decimal and floating-point columns.
@@ -115,21 +128,21 @@ pub struct ColumnDesc {
     /// Declared length of `BIT(n)` columns.
     pub bit_len: u32,
     /// Allowed values of `ENUM` columns (index 1 is the first value).
-    pub enum_values: Option<Arc<Vec<String>>>,
+    pub enum_values: Option<Arc<[String]>>,
     /// Allowed values of `SET` columns (bit 0 is the first value).
-    pub set_values: Option<Arc<Vec<String>>>,
+    pub set_values: Option<Arc<[String]>>,
     pub primary_key: bool,
     /// Excluded through `column_exclude_list`.
     pub excluded: bool,
 }
 
 impl ColumnDesc {
-    pub fn is_binary(&self) -> bool {
+    pub const fn is_binary(&self) -> bool {
         self.charset == BINARY_CHARSET
     }
 
     /// Whether `unsigned` is a meaningful attribute of this column's type.
-    pub fn reports_unsigned(&self) -> bool {
+    pub const fn reports_unsigned(&self) -> bool {
         matches!(
             self.kind,
             ColKind::TinyInt
@@ -173,7 +186,7 @@ impl TableInfo {
         table: String,
         columns: Vec<ColumnDesc>,
         table_map: Option<TableMapEvent<'static>>,
-        convert: &ConvertOptions,
+        convert: ConvertOptions,
     ) -> Self {
         let index_by_name = columns
             .iter()
@@ -197,14 +210,18 @@ impl TableInfo {
     ///
     /// Fails if the event lacks column names, i.e. the server is not running with
     /// `binlog_row_metadata=FULL`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "walks the table map's metadata fields in order"
+    )]
     pub fn from_table_map(
         tme: TableMapEvent<'static>,
         filters: &Filters,
-        convert: &ConvertOptions,
+        convert: ConvertOptions,
     ) -> io::Result<Self> {
         let database = tme.database_name().into_owned();
         let table = tme.table_name().into_owned();
-        let num_columns = tme.columns_count() as usize;
+        let num_columns = usize::try_from(tme.columns_count()).map_err(io::Error::other)?;
 
         let mut names: Vec<String> = Vec::new();
         let mut enum_lists: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -244,12 +261,13 @@ impl TableInfo {
                 }
                 OptionalMetadataField::SimplePrimaryKey(keys) => {
                     for key in keys.iter_indexes() {
-                        primary_key.push(key? as usize);
+                        primary_key.push(usize::try_from(key?).map_err(io::Error::other)?);
                     }
                 }
                 OptionalMetadataField::PrimaryKeyWithPrefix(keys) => {
                     for key in keys.iter_keys() {
-                        primary_key.push(key?.column_index() as usize);
+                        let index = key?.column_index();
+                        primary_key.push(usize::try_from(index).map_err(io::Error::other)?);
                     }
                 }
                 _ => {}
@@ -306,8 +324,8 @@ impl TableInfo {
                     0
                 };
 
-                let decode_values = |raw: Vec<Vec<u8>>| -> Arc<Vec<String>> {
-                    Arc::new(raw.iter().map(|v| decode_text(v, charset)).collect())
+                let decode_values = |raw: Vec<Vec<u8>>| -> Arc<[String]> {
+                    raw.iter().map(|v| decode_text(v, charset)).collect()
                 };
                 let enum_values = (kind == ColKind::Enum)
                     .then(|| enum_lists.next().map(decode_values))
@@ -332,7 +350,7 @@ impl TableInfo {
                 columns.push(ColumnDesc {
                     excluded: filters.column_excluded(&database, &table, &name),
                     name,
-                    position: i as u32 + 1,
+                    position: u32::try_from(i + 1).unwrap_or(u32::MAX),
                     kind,
                     mysql_type: table_schema::mysql_type_from_binlog(kind, column_type, binary),
                     nullable,
@@ -363,7 +381,7 @@ impl TableInfo {
         result_columns: &[Column],
         details: &HashMap<String, ColumnDetails>,
         filters: &Filters,
-        convert: &ConvertOptions,
+        convert: ConvertOptions,
     ) -> Self {
         let columns = result_columns
             .iter()
@@ -384,7 +402,10 @@ impl TableInfo {
                 });
                 ColumnDesc {
                     excluded: filters.column_excluded(database, table, &name),
-                    position: detail.map_or(index as u32 + 1, |d| d.position),
+                    position: detail.map_or_else(
+                        || u32::try_from(index + 1).unwrap_or(u32::MAX),
+                        |d| d.position,
+                    ),
                     kind,
                     mysql_type,
                     nullable: detail.is_none_or(|d| d.nullable),
@@ -448,7 +469,7 @@ pub struct ColumnDetails {
     pub bit_len: u32,
     pub primary_key: bool,
     /// ENUM / SET values parsed from `COLUMN_TYPE`.
-    pub values: Option<Arc<Vec<String>>>,
+    pub values: Option<Arc<[String]>>,
 }
 
 /// Parses `bit(N)` from `information_schema.COLUMNS.COLUMN_TYPE`.

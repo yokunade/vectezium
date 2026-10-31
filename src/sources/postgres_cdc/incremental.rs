@@ -1,5 +1,5 @@
 //! Incremental (chunked) snapshots, read while the slot streams: the read-only watermark
-//! algorithm of Debezium's PostgreSQL connector (DBLog), with a transaction snapshot as the
+//! algorithm of Debezium's PostgreSQL connector (`DBLog`), with a transaction snapshot as the
 //! watermark.
 //!
 //! Each chunk of a table is read in one short `REPEATABLE READ` transaction, in key order:
@@ -135,6 +135,10 @@ pub enum Chunk {
 }
 
 /// Reads the next chunk of `table` after `last_key`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "builds and runs one chunk query as the watermark algorithm needs"
+)]
 pub async fn read_chunk(
     client: &Client,
     settings: &Settings,
@@ -289,6 +293,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::decimal_bitwise_operands,
+        reason = "epochs and xids read best in decimal"
+    )]
     fn widening_across_epochs() {
         let reference = (3_u64 << 32) | 10;
         assert_eq!(widen(5, reference), (3 << 32) | 5);

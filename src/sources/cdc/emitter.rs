@@ -100,6 +100,7 @@ pub struct EventBuilder {
 }
 
 impl EventBuilder {
+    #[must_use]
     pub const fn new(
         source_type: &'static str,
         log_namespace: LogNamespace,
@@ -167,6 +168,7 @@ impl EventBuilder {
     }
 
     /// Builds an event from a plain payload (control and offset events).
+    #[must_use]
     pub fn plain(&self, payload: Map<String, Json>, meta: EventMeta<'_>) -> LogEvent {
         self.build(payload, meta)
     }
@@ -290,6 +292,10 @@ impl<O: CdcOffset> Emitter<O> {
     }
 
     /// Fails once a downstream delivery failure has been reported.
+    ///
+    /// # Errors
+    ///
+    /// Fails after a batch was rejected downstream.
     pub fn check_health(&self) -> Result<(), String> {
         if self.poisoned.load(Ordering::SeqCst) {
             Err(
@@ -341,7 +347,7 @@ impl<O: CdcOffset> Emitter<O> {
     }
 
     /// The event builder, for building events on other tasks (parallel snapshot readers).
-    pub fn builder(&self) -> EventBuilder {
+    pub const fn builder(&self) -> EventBuilder {
         self.builder
     }
 
@@ -354,12 +360,12 @@ impl<O: CdcOffset> Emitter<O> {
     }
 
     /// The `seq` the next event will get.
-    pub fn next_seq(&self) -> u64 {
+    pub const fn next_seq(&self) -> u64 {
         self.next_seq
     }
 
     /// The `(seq, seq_sub)` of the next change event.
-    fn take_seq(&mut self) -> (u64, u64) {
+    const fn take_seq(&mut self) -> (u64, u64) {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.seq_sub = 0;
@@ -367,7 +373,7 @@ impl<O: CdcOffset> Emitter<O> {
     }
 
     /// The `(seq, seq_sub)` of the next snapshot-derived event: after the last change event.
-    fn take_snapshot_seq(&mut self) -> (u64, u64) {
+    const fn take_snapshot_seq(&mut self) -> (u64, u64) {
         self.seq_sub += 1;
         (self.next_seq - 1, self.seq_sub)
     }
@@ -489,12 +495,16 @@ impl<O: CdcOffset> Emitter<O> {
         }
     }
 
-    fn pending_len(&self) -> usize {
+    const fn pending_len(&self) -> usize {
         self.events.len() + self.control_events.len() + self.table_schema_events.len()
     }
 
     /// Flushes when the batch is full or has waited long enough, and enqueues an offset now and
     /// then while nothing is captured.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the events cannot be sent downstream (see [`Self::flush`]).
     pub async fn maybe_flush(&mut self) -> Result<(), String> {
         let full = self.pending_len() >= self.batch_size;
         let stale = self
@@ -510,6 +520,10 @@ impl<O: CdcOffset> Emitter<O> {
     }
 
     /// Sends all queued events downstream and hands the pending offset to the finalizer.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the downstream channel is closed (the topology is shutting down).
     pub async fn flush(&mut self) -> Result<(), String> {
         let offset = self.pending_offset.take();
 
@@ -625,6 +639,10 @@ impl<O: CdcOffset> Emitter<O> {
     }
 
     /// Flushes committed events and releases the finalizer so pending acknowledgements drain.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the last events cannot be sent downstream (see [`Self::flush`]).
     pub async fn close(mut self) -> Result<(), String> {
         self.discard_uncommitted();
         self.flush().await

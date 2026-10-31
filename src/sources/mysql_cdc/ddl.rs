@@ -312,6 +312,7 @@ impl Parser {
 /// Classifies a statement. Returns `None` for anything that is not schema DDL on tables, views,
 /// routines, triggers, events or databases: account and privilege statements, `FLUSH`,
 /// `ANALYZE`/`OPTIMIZE`/`REPAIR TABLE`, tablespaces, servers, plugins, and so on.
+#[allow(clippy::too_many_lines, reason = "one branch per DDL statement form")]
 pub fn classify(sql: &str) -> Option<Ddl> {
     let mut p = Parser::new(sql);
     let verb = p.word()?.to_owned();
@@ -464,6 +465,10 @@ pub fn classify(sql: &str) -> Option<Ddl> {
 ///
 /// With `binlog_format=ROW` such statements only appear in the binlog when a session switched
 /// itself to statement format; their rows are then not in the binlog at all.
+#[allow(
+    clippy::option_option,
+    reason = "not a data-changing statement, versus one whose target cannot be read"
+)]
 pub fn dml_target(sql: &str) -> Option<Option<ObjectName>> {
     let mut p = Parser::new(sql);
     let verb = p.word()?.to_owned();
@@ -562,6 +567,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "compared with `kinds`, which returns an Option"
+    )]
     fn ddl(kind: DdlKind, objects: Vec<ObjectName>) -> Option<(DdlKind, Vec<ObjectName>)> {
         Some((kind, objects))
     }

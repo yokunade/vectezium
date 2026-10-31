@@ -90,7 +90,7 @@ fn json_type(logical: &str, o: &ConvertOptions) -> &'static str {
     }
 }
 
-fn binary_encoding(mode: BinaryHandlingMode) -> &'static str {
+const fn binary_encoding(mode: BinaryHandlingMode) -> &'static str {
     match mode {
         BinaryHandlingMode::Base64 => "base64",
         BinaryHandlingMode::Base64UrlSafe => "base64_url_safe",

@@ -44,7 +44,7 @@ impl ConnectionSettings {
             .options(SESSION_OPTIONS)
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs.max(1)))
             .keepalives(true)
-            .keepalives_idle(Duration::from_secs(60));
+            .keepalives_idle(Duration::from_mins(1));
         if let Some(password) = &config.password {
             pg.password(password.inner());
         }

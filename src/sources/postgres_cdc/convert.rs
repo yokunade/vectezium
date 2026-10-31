@@ -161,14 +161,14 @@ fn decimal(text: &str, scale: Option<i32>, o: &ConvertOptions) -> Result<Json, S
         DecimalHandlingMode::Precise if special => Json::Null,
         DecimalHandlingMode::Precise => {
             let (unscaled, text_scale) = unscaled(text)?;
-            match scale {
+            match scale.and_then(|scale| usize::try_from(scale).ok()) {
                 // A declared scale: the value always has exactly that many digits.
-                Some(scale) if scale >= 0 => {
-                    let unscaled = rescale(&unscaled, text_scale, scale as usize);
+                Some(scale) => {
+                    let unscaled = rescale(&unscaled, text_scale, scale);
                     Json::from(encode_bytes(&twos_complement(&unscaled), o.binary))
                 }
                 // Debezium's VariableScaleDecimal.
-                _ => json!({
+                None => json!({
                     "scale": text_scale,
                     "value": encode_bytes(&twos_complement(&unscaled), o.binary),
                 }),
@@ -205,7 +205,9 @@ fn rescale(unscaled: &str, from: usize, to: usize) -> String {
     if to >= from {
         format!("{unscaled}{}", "0".repeat(to - from))
     } else {
-        unscaled[..unscaled.len() - (from - to)].to_owned()
+        let mut narrowed = unscaled.to_owned();
+        narrowed.truncate(unscaled.len().saturating_sub(from - to));
+        narrowed
     }
 }
 
@@ -223,11 +225,12 @@ fn twos_complement(value: &str) -> Vec<u8> {
         let mut remainder: u32 = 0;
         let mut quotient = Vec::with_capacity(decimal.len());
         for &d in &decimal {
+            // remainder < 256, so acc < 2570 and acc / 256 <= 10.
             let acc = remainder * 10 + u32::from(d);
-            quotient.push((acc / 256) as u8);
+            quotient.push(u8::try_from(acc / 256).expect("quotient below 256"));
             remainder = acc % 256;
         }
-        magnitude.push(remainder as u8);
+        magnitude.push(u8::try_from(remainder).expect("remainder below 256"));
         let first = quotient
             .iter()
             .position(|&d| d != 0)
@@ -310,17 +313,14 @@ fn naive_date(text: &str) -> Result<NaiveDate, String> {
     let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
         return Err(format!("not a date: `{text}`"));
     };
-    let parse = |s: &str| {
-        s.parse::<i32>()
-            .map_err(|_| format!("not a date: `{text}`"))
-    };
-    let mut year = parse(y)?;
+    let bad = || format!("not a date: `{text}`");
+    let mut year = y.parse::<i32>().map_err(|_| bad())?;
     if bc {
         // 1 BC is year 0 (proleptic Gregorian).
         year = 1 - year;
     }
-    NaiveDate::from_ymd_opt(year, parse(m)? as u32, parse(d)? as u32)
-        .ok_or_else(|| format!("not a date: `{text}`"))
+    let part = |s: &str| s.parse::<u32>().map_err(|_| bad());
+    NaiveDate::from_ymd_opt(year, part(m)?, part(d)?).ok_or_else(|| format!("not a date: `{text}`"))
 }
 
 fn date_days(text: &str) -> Result<i64, String> {
@@ -354,12 +354,17 @@ fn time_micros(text: &str) -> Result<i64, String> {
 fn split_offset(text: &str) -> Result<(&str, i64), String> {
     let at = text
         .rfind(['+', '-'])
-        .filter(|&i| i > 0 && text[..i].contains(':'))
+        .filter(|&i| i > 0 && text.get(..i).is_some_and(|time| time.contains(':')))
         .ok_or_else(|| format!("no time zone offset in `{text}`"))?;
     let (rest, offset) = text.split_at(at);
     let sign = if offset.starts_with('-') { -1 } else { 1 };
     let mut seconds = 0;
-    for (i, part) in offset[1..].split(':').enumerate() {
+    for (i, part) in offset
+        .strip_prefix(['+', '-'])
+        .unwrap_or(offset)
+        .split(':')
+        .enumerate()
+    {
         let v: i64 = part
             .parse()
             .map_err(|_| format!("bad offset in `{text}`"))?;
@@ -368,20 +373,21 @@ fn split_offset(text: &str) -> Result<(&str, i64), String> {
     Ok((rest, sign * seconds))
 }
 
-/// `timetz` as Debezium's ZonedTime: the time of day in UTC with a `Z`.
+/// `timetz` as Debezium's `ZonedTime`: the time of day in UTC with a `Z`.
 fn timetz_utc(text: &str) -> Result<String, String> {
     let (time, offset) = split_offset(text)?;
     let micros = (time_micros(time)? - offset * 1_000_000).rem_euclid(MICROS_PER_DAY);
-    let t = NaiveTime::from_num_seconds_from_midnight_opt(
-        (micros / 1_000_000) as u32,
-        ((micros % 1_000_000) * 1000) as u32,
-    )
-    .ok_or_else(|| format!("not a time: `{text}`"))?;
-    Ok(format!("{}Z", format_time(&t)))
+    let secs = u32::try_from(micros / 1_000_000).ok();
+    let nanos = u32::try_from((micros % 1_000_000) * 1000).ok();
+    let t = secs
+        .zip(nanos)
+        .and_then(|(secs, nanos)| NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos))
+        .ok_or_else(|| format!("not a time: `{text}`"))?;
+    Ok(format!("{}Z", format_time(t)))
 }
 
 /// `HH:MM:SS` plus as many fractional digits as the value has (up to 6).
-fn format_time(t: &NaiveTime) -> String {
+fn format_time(t: NaiveTime) -> String {
     let micros = t.nanosecond() / 1000;
     let base = t.format("%H:%M:%S").to_string();
     if micros == 0 {
@@ -420,7 +426,7 @@ fn timestamp(text: &str, millis: bool) -> Result<i64, String> {
     })
 }
 
-/// `timestamptz` (printed in UTC) as Debezium's ZonedTimestamp.
+/// `timestamptz` (printed in UTC) as Debezium's `ZonedTimestamp`.
 fn timestamptz_iso(text: &str) -> Result<String, String> {
     if text == "infinity" || text == "-infinity" {
         return Ok(text.to_owned());
@@ -434,7 +440,7 @@ fn timestamptz_iso(text: &str) -> Result<String, String> {
     })?;
     let utc = local - chrono::Duration::seconds(offset);
     let date = utc.date().format("%Y-%m-%d");
-    Ok(format!("{date}T{}Z", format_time(&utc.time())))
+    Ok(format!("{date}T{}Z", format_time(utc.time())))
 }
 
 /// An ISO-8601 interval (`IntervalStyle=iso_8601`, e.g. `P1Y2M3DT4H5M6.5S`, `P-1D`, `PT-0.5S`)
@@ -456,6 +462,10 @@ fn interval_micros(text: &str) -> Result<i64, String> {
             }
             let v: f64 = number.parse().map_err(|_| bad())?;
             number.clear();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "86_400_000_000 is exactly representable in f64"
+            )]
             let day = MICROS_PER_DAY as f64;
             total += v * match (units, c) {
                 ("YMWD", 'Y') => 12.0 * DAYS_PER_MONTH * day,
@@ -471,7 +481,12 @@ fn interval_micros(text: &str) -> Result<i64, String> {
             return Err(bad());
         }
     }
-    Ok(total.round() as i64)
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "`as` saturates; intervals beyond about 292,000 years cannot be represented anyway"
+    )]
+    let micros = total.round() as i64;
+    Ok(micros)
 }
 
 /// `bit(1)` as a boolean; longer bit strings as Debezium's `Bits`: bytes, least significant
@@ -523,7 +538,7 @@ enum Element {
 /// dimensions like `[0:1]=`) converted element by element.
 fn array(text: &str, element: &Kind, column: &Column, o: &ConvertOptions) -> Result<Json, String> {
     let body = match text.find("={") {
-        Some(i) if text.starts_with('[') => &text[i + 1..],
+        Some(i) if text.starts_with('[') => text.get(i + 1..).unwrap_or(text),
         _ => text,
     };
     let mut chars = body.chars().peekable();
@@ -588,7 +603,7 @@ fn parse_array(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<V
             }
         }
         match chars.next()? {
-            ',' => continue,
+            ',' => {}
             '}' => return Some(out),
             _ => return None,
         }

@@ -224,6 +224,10 @@ pub enum SslMode {
 ))]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "configuration options, each an independent switch"
+)]
 pub struct PostgresCdcConfig {
     /// The PostgreSQL server host name or IP address.
     #[serde(default = "default_hostname")]
@@ -362,7 +366,7 @@ pub struct PostgresCdcConfig {
     #[serde(default = "default_money_fraction_digits")]
     pub money_fraction_digits: u8,
 
-    /// The value of a large (TOASTed) column an update did not change, when the old row does
+    /// The value of a large (`TOASTed`) column an update did not change, when the old row does
     /// not have it either (`REPLICA IDENTITY` other than `FULL`). Debezium's
     /// `unavailable.value.placeholder`.
     #[serde(default = "default_unavailable_value_placeholder")]
@@ -592,7 +596,7 @@ impl PostgresCdcConfig {
 #[typetag::serde(name = "postgres_cdc")]
 impl SourceConfig for PostgresCdcConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
-        source::build(self, cx).await
+        source::build(self, cx)
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
