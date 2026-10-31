@@ -101,11 +101,10 @@ pub(super) async fn stream(
     mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
     info!(message = "Streaming changes from the replication slot.", offset = %start);
-    let mut spool = settings
-        .signals
-        .as_ref()
-        .map(|config| Spool::open(config, start.last_signal.as_deref()))
-        .transpose()?;
+    let mut spool = match &settings.signals {
+        Some(config) => Some(Spool::open(config, start.last_signal.as_deref()).await?),
+        None => None,
+    };
     let known = known_tables(settings, &query, registry, captured).await?;
     let mut state = State {
         settings,
@@ -377,16 +376,14 @@ async fn apply_signals(
     spool: &mut Spool,
     emitter: &mut Emitter,
 ) -> Result<bool, String> {
-    let done = signal::apply_due(spool, state);
+    let done = signal::apply_due(spool, state).await;
     if done.is_empty() {
         return Ok(false);
     }
     state.offset.last_signal = signal::last_signal(&done);
     emitter.commit(state.offset.clone());
     emitter.flush().await?;
-    for (received, outcome) in &done {
-        spool.finish(received, outcome);
-    }
+    spool.finish(done).await;
     Ok(true)
 }
 
