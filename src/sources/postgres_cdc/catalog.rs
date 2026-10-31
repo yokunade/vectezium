@@ -510,6 +510,30 @@ pub async fn filtered_tables(
         .collect())
 }
 
+/// The user tables without a replica identity (no primary key with `REPLICA IDENTITY DEFAULT`,
+/// or `REPLICA IDENTITY NOTHING`): once published, PostgreSQL rejects every `UPDATE` and
+/// `DELETE` on them. Sorted.
+pub async fn tables_without_identity(client: &Client) -> Result<Vec<(String, String)>, String> {
+    let rows = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition \
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%' \
+               AND (c.relreplident = 'n' OR (c.relreplident = 'd' AND NOT EXISTS ( \
+                    SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary))) \
+             ORDER BY 1, 2",
+            &[],
+        )
+        .await
+        .map_err(|error| format!("failed to read replica identities: {error}"))?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect())
+}
+
 /// Quotes an identifier for SQL.
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))

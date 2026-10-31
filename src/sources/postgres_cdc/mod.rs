@@ -116,10 +116,19 @@ pub enum PublicationAutocreateMode {
 
     /// Create the publication for the tables the include/exclude lists capture, if it does not
     /// exist. Needs ownership of those tables (or superuser).
+    ///
+    /// Once a table is published, PostgreSQL rejects every `UPDATE` and `DELETE` on it unless it
+    /// has a replica identity (a primary key, `REPLICA IDENTITY USING INDEX` or `FULL`). Tables
+    /// without one are left out of the publication, with a warning, so production writes keep
+    /// working.
     #[default]
     Filtered,
 
     /// Create the publication `FOR ALL TABLES`, if it does not exist. Needs superuser.
+    ///
+    /// Refused while any table in the database lacks a replica identity: PostgreSQL would reject
+    /// every `UPDATE` and `DELETE` on it. Tables created later are published too, so give each
+    /// new table a primary key (or another replica identity) before writing to it.
     AllTables,
 }
 

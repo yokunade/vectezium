@@ -502,6 +502,21 @@ async fn inspect_server(client: &Client, settings: &Settings) -> Result<String, 
     Ok(system_id)
 }
 
+/// Splits the tables a filtered publication is created for: those with a replica identity, and
+/// those left out (`keyless`, where PostgreSQL would reject updates and deletes once published).
+fn publishable(wanted: &[TableRef], keyless: &[TableRef]) -> (Vec<TableRef>, Vec<TableRef>) {
+    wanted.iter().cloned().partition(|t| !keyless.contains(t))
+}
+
+/// `schema.table, …`, for messages.
+fn names(tables: &[TableRef]) -> String {
+    tables
+        .iter()
+        .map(|(s, t)| format!("{s}.{t}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Makes sure the publication exists (creating it per `publication_autocreate_mode`) and warns
 /// about captured tables it does not include.
 async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), String> {
@@ -513,7 +528,13 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
         .is_some();
     let wanted = catalog::filtered_tables(client, &settings.filters).await?;
     if !exists {
-        let sql = match settings.autocreate {
+        // Once a table is published, PostgreSQL rejects every UPDATE and DELETE on it unless it
+        // has a replica identity: creating the publication must not break the application.
+        let keyless = match settings.autocreate {
+            PublicationAutocreateMode::Disabled => Vec::new(),
+            _ => catalog::tables_without_identity(client).await?,
+        };
+        let (sql, tables) = match settings.autocreate {
             PublicationAutocreateMode::Disabled => {
                 return Err(format!(
                     "publication `{name}` does not exist and `publication_autocreate_mode` is \
@@ -521,23 +542,50 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
                 ));
             }
             PublicationAutocreateMode::AllTables => {
-                format!("CREATE PUBLICATION {} FOR ALL TABLES", quote_ident(name))
-            }
-            PublicationAutocreateMode::Filtered => {
-                if wanted.is_empty() {
+                if !keyless.is_empty() {
                     return Err(format!(
-                        "publication `{name}` does not exist and the include/exclude lists match \
-                         no tables to create it for"
+                        "publication `{name}` does not exist, and creating it FOR ALL TABLES \
+                         would make PostgreSQL reject every UPDATE and DELETE on tables without \
+                         a replica identity: {}. Give them a primary key (or REPLICA IDENTITY \
+                         USING INDEX / FULL), or use `publication_autocreate_mode: filtered`",
+                        names(&keyless)
                     ));
                 }
-                let tables = wanted
+                (
+                    format!("CREATE PUBLICATION {} FOR ALL TABLES", quote_ident(name)),
+                    wanted.len(),
+                )
+            }
+            PublicationAutocreateMode::Filtered => {
+                let (published, left_out) = publishable(&wanted, &keyless);
+                if !left_out.is_empty() {
+                    warn!(
+                        message = "Left tables without a replica identity out of the new publication: \
+                                   once published, PostgreSQL would reject every UPDATE and DELETE \
+                                   on them. Give them a primary key (or REPLICA IDENTITY USING INDEX / \
+                                   FULL), then ALTER PUBLICATION … ADD TABLE.",
+                        publication = %name,
+                        tables = %names(&left_out),
+                        internal_log_rate_limit = false,
+                    );
+                }
+                if published.is_empty() {
+                    return Err(format!(
+                        "publication `{name}` does not exist and the include/exclude lists match \
+                         no tables (with a replica identity) to create it for"
+                    ));
+                }
+                let tables = published
                     .iter()
                     .map(|(s, t)| format!("{}.{}", quote_ident(s), quote_ident(t)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!(
-                    "CREATE PUBLICATION {} FOR TABLE {tables}",
-                    quote_ident(name)
+                (
+                    format!(
+                        "CREATE PUBLICATION {} FOR TABLE {tables}",
+                        quote_ident(name)
+                    ),
+                    published.len(),
                 )
             }
         };
@@ -547,7 +595,7 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
                 error_text(&error)
             )
         })?;
-        info!(message = "Created the publication.", publication = %name, tables = wanted.len());
+        info!(message = "Created the publication.", publication = %name, tables);
         return Ok(());
     }
     let published: HashSet<TableRef> = catalog::captured_tables(client, name, &settings.filters)
@@ -992,4 +1040,20 @@ async fn run(
     )
     .await?;
     emitter.close().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_publication_leaves_out_tables_without_a_replica_identity() {
+        let t = |name: &str| ("public".to_owned(), name.to_owned());
+        let wanted = [t("customers"), t("events"), t("orders")];
+        let keyless = [t("events"), t("audit")];
+        let (published, left_out) = publishable(&wanted, &keyless);
+        assert_eq!(published, [t("customers"), t("orders")]);
+        assert_eq!(left_out, [t("events")]);
+        assert_eq!(names(&left_out), "public.events");
+    }
 }
