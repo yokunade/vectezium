@@ -793,6 +793,14 @@ async fn open_window(
                     internal_log_rate_limit = false,
                 );
             }
+            Chunk::BadPosition => {
+                warn!(
+                    message = "The stored position of an incremental snapshot is not a valid key \
+                               of the table; skipping it. Snapshot the table again.",
+                    table = %name,
+                    internal_log_rate_limit = false,
+                );
+            }
         }
         // Skipped: move on to the next table.
         if let Some(progress) = state.offset.incremental.as_mut() {

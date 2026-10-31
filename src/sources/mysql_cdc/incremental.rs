@@ -25,7 +25,7 @@ use std::{
 };
 
 use chrono::Utc;
-use mysql_async::{Conn, prelude::Queryable};
+use mysql_async::{Conn, Value, prelude::Queryable};
 use serde_json::{Map, Value as Json};
 
 use super::{
@@ -484,20 +484,32 @@ async fn read(
         quote_ident(database),
         quote_ident(table)
     );
+    let mut params = Vec::new();
     if let Some(last) = &last_key {
         if last.len() != keys.len() {
             return Err(ReadError::Skip(
                 "the key changed since the snapshot started; snapshot it again".into(),
             ));
         }
-        write!(query, " WHERE ({key_list}) > ({})", last.join(", ")).expect("writing to a String");
+        // The position comes from the stored or recovered offset: bind it, never splice it in.
+        params = last
+            .iter()
+            .map(|literal| parse_key_literal(literal))
+            .collect::<Option<Vec<Value>>>()
+            .ok_or_else(|| {
+                ReadError::Skip(
+                    "the stored chunk position is not a valid key; snapshot it again".into(),
+                )
+            })?;
+        let placeholders = vec!["?"; params.len()].join(", ");
+        write!(query, " WHERE ({key_list}) > ({placeholders})").expect("writing to a String");
     }
     let limit = settings.incremental_chunk_size;
     write!(query, " ORDER BY {key_list} LIMIT {limit}").expect("writing to a String");
 
     let low = gtid_executed(conn).await?;
     let mut result = conn
-        .exec_iter(query, ())
+        .exec_iter(query, params)
         .await
         .map_err(|error| ReadError::Fail(format!("reading `{database}`.`{table}`: {error}")))?;
     let result_columns = result
@@ -563,4 +575,104 @@ async fn read(
         last_key: last,
         exhausted,
     }))
+}
+
+/// Parses a stored chunk position, written by `Value::as_sql(false)`, back into a value to bind.
+/// Only the forms `as_sql` writes are accepted: `NULL`, a number, `0x` + hex bytes, or a quoted
+/// string with backslash escapes (which also covers dates and times). Anything else is `None`.
+fn parse_key_literal(literal: &str) -> Option<Value> {
+    if literal == "NULL" {
+        return Some(Value::NULL);
+    }
+    if let Some(quoted) = literal.strip_prefix('\'') {
+        return unescape_quoted(quoted.strip_suffix('\'')?).map(|s| Value::Bytes(s.into_bytes()));
+    }
+    if let Some(hex_digits) = literal.strip_prefix("0x") {
+        return hex::decode(hex_digits).ok().map(Value::Bytes);
+    }
+    if let Ok(i) = literal.parse::<i64>() {
+        return Some(Value::Int(i));
+    }
+    if let Ok(u) = literal.parse::<u64>() {
+        return Some(Value::UInt(u));
+    }
+    // Floats, as `{}` prints them; `parse` alone would also take `inf` and `NaN`.
+    if literal
+        .bytes()
+        .all(|b| b.is_ascii_digit() || b"+-.e".contains(&b))
+    {
+        return literal.parse::<f64>().ok().map(Value::Double);
+    }
+    None
+}
+
+/// The inverse of `as_sql`'s string escaping: rejects an unescaped quote or an unknown escape.
+fn unescape_quoted(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(match chars.next()? {
+                '0' => '\0',
+                'n' => '\n',
+                'r' => '\r',
+                'Z' => '\x1a',
+                c @ ('\\' | '\'' | '"') => c,
+                _ => return None,
+            }),
+            '\'' => return None,
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_literals_round_trip() {
+        let values = [
+            Value::NULL,
+            Value::Int(-42),
+            Value::Int(i64::MAX),
+            Value::UInt(u64::MAX),
+            Value::Double(2.5),
+            Value::Double(-1e-7),
+            Value::Bytes(b"plain".to_vec()),
+            Value::Bytes("it's a \"quote\", a \\ and \0\n\r\x1a".as_bytes().to_vec()),
+            Value::Bytes("ünïcödé".as_bytes().to_vec()),
+            Value::Bytes(vec![0xff, 0x00, 0x80]),
+        ];
+        for value in values {
+            let literal = value.as_sql(false);
+            assert_eq!(parse_key_literal(&literal), Some(value), "{literal}");
+        }
+        // Dates and times come back as strings, which MySQL compares as it did the literal.
+        let date = Value::Date(2026, 10, 31, 12, 30, 0, 250);
+        assert_eq!(
+            parse_key_literal(&date.as_sql(false)),
+            Some(Value::Bytes(b"2026-10-31 12:30:00.000250".to_vec()))
+        );
+    }
+
+    #[test]
+    fn key_literals_reject_injection() {
+        for literal in [
+            "1) OR (1=1",
+            "1; DROP TABLE t",
+            "'a' OR '1'='1'",
+            "'unterminated",
+            "'a'b'",
+            "'\\x'",
+            "0xZZ",
+            "inf",
+            "NaN",
+            "SLEEP(10)",
+            "",
+        ] {
+            assert_eq!(parse_key_literal(literal), None, "{literal}");
+        }
+    }
 }
