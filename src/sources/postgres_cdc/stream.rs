@@ -252,9 +252,10 @@ async fn session(
     status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut flush = tokio::time::interval(Duration::from_millis(100));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The server sends keepalives at half its `wal_sender_timeout`; silence for much longer means
-    // the connection is gone (a half-open TCP connection never errors on its own). Measured from
-    // the last message, not per `select!` pass: the other branches wake the loop far more often.
+    // An idle server that hears from us sends nothing, so a status update after a quiet interval
+    // asks it for a keepalive; no answer for much longer means the connection is gone (a
+    // half-open TCP connection never errors on its own). Measured from the last message, not per
+    // `select!` pass: the other branches wake the loop far more often.
     let silence = interval * 3 + Duration::from_mins(1);
     let mut last_message = Instant::now();
     if let Some(end) = open_window(state, replication).await? {
@@ -267,7 +268,12 @@ async fn session(
                 if last_message.elapsed() >= silence {
                     return Ok(End::Disconnected(format!("no message from the server for {silence:?}")));
                 }
-                if let Err(error) = replication.status(state.received, state.released).await {
+                let sent = if last_message.elapsed() >= interval {
+                    replication.request_keepalive(state.received, state.released).await
+                } else {
+                    replication.status(state.received, state.released).await
+                };
+                if let Err(error) = sent {
                     return Ok(End::Disconnected(format!("failed to send a status update: {}", error_text(&error))));
                 }
             }
