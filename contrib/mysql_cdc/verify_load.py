@@ -66,10 +66,12 @@ def main():
         m = row["metadata"]
         if m.get("db") != "loadtest":
             continue
-        # Replayed events must carry the same seq as their first delivery.
-        ident = (m["table"], m["file"], m["pos"], m["row"], m["op"], m["op"] == "r" and row["record"]["id"])
-        if seq_of.setdefault(ident, m.get("seq")) != m.get("seq"):
-            seq_conflicts += 1
+        # Replayed changes must carry the same seq as their first delivery. Snapshot reads need
+        # not: a snapshot read again after a crash numbers its rows afresh (README, Duplicates).
+        if m["op"] != "r":
+            ident = (m["table"], m["file"], m["pos"], m["row"], m["op"])
+            if seq_of.setdefault(ident, m.get("seq")) != m.get("seq"):
+                seq_conflicts += 1
         if m["op"] == "r":
             snapshot_ids.add(m.get("snapshot_id"))
         raw += 1
@@ -106,7 +108,7 @@ def main():
         failures.append(f"snapshot ids disagree: rows {snapshot_ids}, markers {[e.get('snapshot_id') for e in ends.values()]}")
 
     if seq_conflicts:
-        failures.append(f"{seq_conflicts} replayed events got a different seq than their first delivery")
+        failures.append(f"{seq_conflicts} replayed changes got a different seq than their first delivery")
     if any(r["metadata"].get("seq") is None for r in rows):
         failures.append("events without metadata.seq")
 
