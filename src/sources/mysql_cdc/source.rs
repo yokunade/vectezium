@@ -45,13 +45,17 @@ use crate::{
     },
 };
 
-/// MySQL's system databases, never captured.
+/// `MySQL`'s system databases, never captured.
 const SYSTEM_DATABASES: &[&str] = &["mysql", "sys", "performance_schema", "information_schema"];
 
 /// Version reported in `source.version`.
 pub const CONNECTOR_VERSION: &str = concat!("vector-mysql_cdc-", env!("CARGO_PKG_VERSION"));
 
 /// Static settings shared by the snapshot and streaming phases.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "settings derived from independent configuration options"
+)]
 pub(super) struct Settings {
     pub opts: Opts,
     pub endpoint: String,
@@ -95,8 +99,7 @@ impl Settings {
         let first = self
             .warned_no_key
             .lock()
-            .map(|mut warned| warned.insert(name.clone()))
-            .unwrap_or(false);
+            .is_ok_and(|mut warned| warned.insert(name.clone()));
         if first {
             warn!(
                 message = "Table has no primary key; its change events carry no key, so a downstream \
@@ -137,7 +140,11 @@ impl Settings {
     }
 }
 
-pub(super) async fn build(config: &MysqlCdcConfig, cx: SourceContext) -> crate::Result<Source> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "validates the config and wires the source together"
+)]
+pub(super) fn build(config: &MysqlCdcConfig, cx: SourceContext) -> crate::Result<Source> {
     if config.server_id == 0 {
         return Err("`server_id` must be a non-zero, unique replica id".into());
     }
@@ -200,7 +207,7 @@ pub(super) async fn build(config: &MysqlCdcConfig, cx: SourceContext) -> crate::
         publish_offsets: config
             .publish_offsets
             .then(|| Duration::from_secs(config.offset_publish_interval_secs.max(1))),
-        warned_no_key: Default::default(),
+        warned_no_key: std::sync::Mutex::default(),
     };
 
     let acknowledgements = cx.do_acknowledgements(config.acknowledgements);
@@ -284,7 +291,7 @@ fn build_opts(config: &MysqlCdcConfig) -> Opts {
         .user(Some(config.user.clone()))
         .pass(config.password.as_ref().map(|p| p.inner().to_owned()))
         .prefer_socket(false)
-        .tcp_keepalive(Some(Duration::from_secs(60)));
+        .tcp_keepalive(Some(Duration::from_mins(1)));
 
     if config.ssl_mode != SslMode::Disabled {
         let mut ssl = SslOpts::default();
@@ -408,7 +415,7 @@ pub(super) struct BinlogPosition {
     pub gtid_set: String,
 }
 
-/// Reads the foreign keys of captured tables. Warns about cascading ones: MySQL applies
+/// Reads the foreign keys of captured tables. Warns about cascading ones: `MySQL` applies
 /// `ON DELETE/UPDATE CASCADE`, `SET NULL` and `SET DEFAULT` inside the storage engine and does
 /// not write the resulting child-row changes to the binlog, so they never reach the stream.
 async fn foreign_keys(conn: &mut Conn, filters: &Filters) -> Result<HashMap<String, Json>, String> {
@@ -529,7 +536,11 @@ async fn offset_available(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the source's lifecycle: recover, snapshot, stream"
+)]
 async fn run(
     settings: Settings,
     data_dir: PathBuf,
@@ -953,10 +964,10 @@ async fn announce_held(
     emitter.flush().await
 }
 
-/// MySQL's emitter: the shared CDC emitter with binlog offsets.
+/// `MySQL`'s emitter: the shared CDC emitter with binlog offsets.
 pub(super) type Emitter = crate::sources::cdc::emitter::Emitter<Offset>;
 
-/// Queues MySQL schema documents on the emitter.
+/// Queues `MySQL` schema documents on the emitter.
 pub(super) trait NoteTableSchema {
     /// Queues the schema document of `info` for the `table_schemas` output, the first time this
     /// process sees its schema version.

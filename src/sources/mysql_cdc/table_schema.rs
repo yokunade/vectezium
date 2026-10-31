@@ -7,7 +7,7 @@
 //!
 //! A document describes each column twice:
 //!
-//! * as MySQL sees it — `mysql_type`, `nullable`, `primary_key`, `unsigned`, `precision`,
+//! * as `MySQL` sees it — `mysql_type`, `nullable`, `primary_key`, `unsigned`, `precision`,
 //!   `scale`, `fsp`, `bit_length`, `values` (ENUM/SET);
 //! * as the source *encodes* it in JSON — `json_type` plus a `logical_type` from a small, fixed
 //!   vocabulary (see [`LogicalType`]). The logical types map one-to-one onto Parquet / Arrow
@@ -138,11 +138,12 @@ impl LogicalType {
 }
 
 /// The logical type the converter produces for `column` (mirrors `convert.rs`).
-pub fn logical_type(column: &ColumnDesc, convert: &ConvertOptions) -> LogicalType {
+pub fn logical_type(column: &ColumnDesc, convert: ConvertOptions) -> LogicalType {
     match column.kind {
-        ColKind::TinyInt | ColKind::SmallInt | ColKind::MediumInt => LogicalType::Int32,
         ColKind::Int if column.unsigned => LogicalType::Int64,
-        ColKind::Int => LogicalType::Int32,
+        ColKind::TinyInt | ColKind::SmallInt | ColKind::MediumInt | ColKind::Int => {
+            LogicalType::Int32
+        }
         ColKind::BigInt => LogicalType::Int64,
         ColKind::Float => LogicalType::Float32,
         ColKind::Double => LogicalType::Float64,
@@ -179,7 +180,7 @@ pub fn logical_type(column: &ColumnDesc, convert: &ConvertOptions) -> LogicalTyp
     }
 }
 
-fn binary_encoding(mode: BinaryHandlingMode) -> &'static str {
+const fn binary_encoding(mode: BinaryHandlingMode) -> &'static str {
     match mode {
         BinaryHandlingMode::Base64 => "base64",
         BinaryHandlingMode::Base64UrlSafe => "base64_url_safe",
@@ -193,7 +194,7 @@ fn mode_str<T: serde::Serialize>(mode: T) -> Json {
 
 /// Describes one column. Only facts that both `information_schema` and binlog table maps
 /// provide are included, so snapshot and streaming produce identical descriptions.
-fn column_json(column: &ColumnDesc, convert: &ConvertOptions) -> Json {
+fn column_json(column: &ColumnDesc, convert: ConvertOptions) -> Json {
     let logical = logical_type(column, convert);
     let mut c = Map::with_capacity(16);
     c.insert("name".into(), json!(column.name));
@@ -256,7 +257,7 @@ pub fn core(
     database: &str,
     table: &str,
     columns: &[ColumnDesc],
-    convert: &ConvertOptions,
+    convert: ConvertOptions,
 ) -> Map<String, Json> {
     let included: Vec<&ColumnDesc> = columns.iter().filter(|c| !c.excluded).collect();
     let primary_key: Vec<&str> = included
@@ -334,13 +335,15 @@ pub fn document(
     doc
 }
 
-/// Normalized MySQL type name from a binlog column type (real type) and character set.
-pub fn mysql_type_from_binlog(
+/// Normalized `MySQL` type name from a binlog column type (real type) and character set.
+pub const fn mysql_type_from_binlog(
     kind: ColKind,
     column_type: mysql_async::consts::ColumnType,
     binary: bool,
 ) -> &'static str {
-    use mysql_async::consts::ColumnType::*;
+    use mysql_async::consts::ColumnType::{
+        MYSQL_TYPE_STRING, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_VARCHAR,
+    };
     match kind {
         ColKind::TinyInt => "tinyint",
         ColKind::SmallInt => "smallint",
@@ -373,7 +376,7 @@ pub fn mysql_type_from_binlog(
     }
 }
 
-/// Normalized MySQL type name from `information_schema.COLUMNS.DATA_TYPE`.
+/// Normalized `MySQL` type name from `information_schema.COLUMNS.DATA_TYPE`.
 pub fn mysql_type_from_information_schema(data_type: &str) -> &'static str {
     match data_type.to_ascii_lowercase().as_str() {
         "tinyint" => "tinyint",
@@ -408,13 +411,13 @@ pub fn mysql_type_from_information_schema(data_type: &str) -> &'static str {
 
 /// Parses the values of `enum('a','b')` / `set('x','y')` from `COLUMN_TYPE`.
 pub fn parse_value_list(column_type: &str) -> Option<Vec<String>> {
-    let open = column_type.find('(')?;
-    let prefix = column_type[..open].trim().to_ascii_lowercase();
+    let (prefix, list) = column_type.split_once('(')?;
+    let prefix = prefix.trim().to_ascii_lowercase();
     if prefix != "enum" && prefix != "set" {
         return None;
     }
     let mut values = Vec::new();
-    let mut chars = column_type[open + 1..].chars().peekable();
+    let mut chars = list.chars().peekable();
     loop {
         match chars.next()? {
             '\'' => {
@@ -512,13 +515,13 @@ mod tests {
         created.fsp = 6;
         let mut status = col("status", ColKind::Enum, "enum");
         status.position = 3;
-        status.enum_values = Some(Arc::new(vec!["new".into(), "done".into()]));
+        status.enum_values = Some(Arc::from(vec!["new".into(), "done".into()]));
         let columns = vec![id, created, status];
 
-        let core1 = core("app", "orders", &columns, &opts());
+        let core1 = core("app", "orders", &columns, opts());
         let v1 = version(&core1);
         assert_eq!(v1.len(), 16);
-        assert_eq!(v1, version(&core("app", "orders", &columns, &opts())));
+        assert_eq!(v1, version(&core("app", "orders", &columns, opts())));
 
         assert_eq!(core1["primary_key"], json!(["id"]));
         assert_eq!(
@@ -537,22 +540,22 @@ mod tests {
         amount.precision = Some(10);
         amount.scale = Some(2);
         with_decimal.push(amount);
-        let v_string = version(&core("app", "orders", &with_decimal, &opts()));
-        let v_double = version(&core("app", "orders", &with_decimal, &other));
+        let v_string = version(&core("app", "orders", &with_decimal, opts()));
+        let v_double = version(&core("app", "orders", &with_decimal, other));
         assert_ne!(v_string, v_double);
         assert_ne!(v1, v_string);
 
         // Excluded columns are not part of the schema.
-        let mut excluded = columns.clone();
+        let mut excluded = columns;
         excluded[2].excluded = true;
-        let core_ex = core("app", "orders", &excluded, &opts());
+        let core_ex = core("app", "orders", &excluded, opts());
         assert_eq!(core_ex["columns"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn document_adds_version_and_observation() {
         let columns = vec![col("id", ColKind::BigInt, "bigint")];
-        let core = core("app", "t", &columns, &opts());
+        let core = core("app", "t", &columns, opts());
         let v = version(&core);
         let observed = Observed {
             origin: "binlog",

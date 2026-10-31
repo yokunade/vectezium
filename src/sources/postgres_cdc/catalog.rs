@@ -111,13 +111,19 @@ impl TypeRegistry {
     fn resolve_depth(&self, oid: u32, depth: u8) -> TypeInfo {
         let name = self.name(oid);
         if depth > 8 {
-            return TypeInfo { name, kind: Kind::Text };
+            return TypeInfo {
+                name,
+                kind: Kind::Text,
+            };
         }
         if let Some(kind) = builtin(oid) {
             return TypeInfo { name, kind };
         }
         let Some(t) = self.types.get(&oid) else {
-            return TypeInfo { name, kind: Kind::Text };
+            return TypeInfo {
+                name,
+                kind: Kind::Text,
+            };
         };
         let kind = match t.typtype {
             // A domain converts like its base type.
@@ -186,7 +192,7 @@ fn builtin(oid: u32) -> Option<Kind> {
     })
 }
 
-fn builtin_name(oid: u32) -> Option<&'static str> {
+const fn builtin_name(oid: u32) -> Option<&'static str> {
     Some(match oid {
         16 => "bool",
         21 => "int2",
@@ -243,7 +249,11 @@ impl Column {
 
     /// Fractional-second digits of `time(p)`, `timestamp(p)`, … (6 when not declared).
     pub fn time_precision(&self) -> i32 {
-        if self.typmod >= 0 { self.typmod.min(6) } else { 6 }
+        if self.typmod >= 0 {
+            self.typmod.min(6)
+        } else {
+            6
+        }
     }
 
     /// The declared length of `bit(n)` / `varbit(n)`.
@@ -307,10 +317,16 @@ async fn read_table(
             type_oid: row.get(3),
             typmod: row.get(4),
             not_null: row.get(5),
-            pk_position: row.get::<_, Option<i32>>(6).map(|p| p as usize),
+            pk_position: row
+                .get::<_, Option<i32>>(6)
+                .and_then(|p| usize::try_from(p).ok()),
         })
         .collect();
-    Ok(Some((relid, identity.chars().next().unwrap_or('d'), columns)))
+    Ok(Some((
+        relid,
+        identity.chars().next().unwrap_or('d'),
+        columns,
+    )))
 }
 
 /// A column as a replication `Relation` message describes it.
@@ -388,20 +404,19 @@ impl TableInfo {
                 }
             })
             .collect();
-        let key: Vec<usize> = match filters.key_columns(schema, table) {
-            Some(names) => names
+        let key: Vec<usize> = if let Some(names) = filters.key_columns(schema, table) {
+            names
                 .iter()
                 .filter_map(|n| columns.iter().position(|c| &c.name == n))
-                .collect(),
-            None => {
-                let mut pk: Vec<(usize, usize)> = columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.primary_key.map(|p| (p, i)))
-                    .collect();
-                pk.sort_unstable();
-                pk.into_iter().map(|(_, i)| i).collect()
-            }
+                .collect()
+        } else {
+            let mut pk: Vec<(usize, usize)> = columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.primary_key.map(|p| (p, i)))
+                .collect();
+            pk.sort_unstable();
+            pk.into_iter().map(|(_, i)| i).collect()
         };
         let schema_core = table_schema::core(schema, table, &columns, &key, convert);
         let schema_version = table_schema::version(&schema_core);
@@ -487,7 +502,10 @@ mod tests {
             position: 1,
             type_oid: 0,
             typmod,
-            ty: TypeInfo { name: "t".into(), kind },
+            ty: TypeInfo {
+                name: "t".into(),
+                kind,
+            },
             nullable: true,
             primary_key: None,
             excluded: false,
@@ -508,7 +526,10 @@ mod tests {
     #[test]
     fn builtin_arrays_and_names() {
         let registry = TypeRegistry::default();
-        assert_eq!(registry.resolve(1007).kind, Kind::Array(Box::new(Kind::Int32)));
+        assert_eq!(
+            registry.resolve(1007).kind,
+            Kind::Array(Box::new(Kind::Int32))
+        );
         assert_eq!(registry.resolve(25).kind, Kind::Text);
         assert_eq!(registry.resolve(1184).name, "timestamptz");
         assert_eq!(registry.resolve(99999).name, "oid:99999");
@@ -529,7 +550,10 @@ mod tests {
         registry.types.insert(50003, t("positive", 'd', 0, 1700));
         assert_eq!(registry.resolve(50001).kind, Kind::Enum);
         assert_eq!(registry.resolve(50001).name, "public.mood");
-        assert_eq!(registry.resolve(50002).kind, Kind::Array(Box::new(Kind::Enum)));
+        assert_eq!(
+            registry.resolve(50002).kind,
+            Kind::Array(Box::new(Kind::Enum))
+        );
         assert_eq!(registry.resolve(50003).kind, Kind::Numeric);
     }
 

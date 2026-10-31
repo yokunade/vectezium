@@ -32,10 +32,7 @@ jobs:
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      # Vector's lint set (deny(warnings) with pedantic lints) still finds ~214 issues in the CDC
-      # code. Report them without failing the build until they are fixed, then drop this line.
       - name: Clippy
-        continue-on-error: true
         run: cargo clippy --locked --lib --tests --no-default-features --features "$FEATURES" -- -D warnings
       - name: Unit tests
         run: >

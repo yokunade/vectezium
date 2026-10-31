@@ -65,8 +65,6 @@ pub mod mqtt;
 pub mod cdc;
 #[cfg(feature = "sources-mysql_cdc")]
 pub mod mysql_cdc;
-#[cfg(feature = "sources-postgres_cdc")]
-pub mod postgres_cdc;
 #[cfg(feature = "sources-nats")]
 pub mod nats;
 #[cfg(feature = "sources-nginx_metrics")]
@@ -75,6 +73,8 @@ pub mod nginx_metrics;
 pub mod okta;
 #[cfg(feature = "sources-opentelemetry")]
 pub mod opentelemetry;
+#[cfg(feature = "sources-postgres_cdc")]
+pub mod postgres_cdc;
 #[cfg(feature = "sources-postgresql_metrics")]
 pub mod postgresql_metrics;
 #[cfg(any(

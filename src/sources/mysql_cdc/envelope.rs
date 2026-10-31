@@ -1,4 +1,4 @@
-//! The MySQL `source` block of change events (binlog position, GTID, …). The envelopes
+//! The `MySQL` `source` block of change events (binlog position, GTID, …). The envelopes
 //! themselves are shared with every connector (`cdc::envelope`).
 //!
 //! ```json
@@ -18,7 +18,7 @@ pub use crate::sources::cdc::envelope::{Op, SnapshotMarker, SourceBlock};
 #[cfg(test)]
 use crate::sources::cdc::envelope::{change_event, record_event};
 
-/// Values for the `source` block of one MySQL change event.
+/// Values for the `source` block of one `MySQL` change event.
 #[derive(Clone, Debug)]
 pub struct SourceInfo<'a> {
     pub connector_version: &'a str,

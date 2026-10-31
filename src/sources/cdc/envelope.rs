@@ -24,6 +24,7 @@ pub enum Op {
 }
 
 impl Op {
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Op::Create => "c",
@@ -48,6 +49,7 @@ pub enum SnapshotMarker {
 }
 
 impl SnapshotMarker {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             SnapshotMarker::False => "false",
@@ -62,7 +64,7 @@ impl SnapshotMarker {
 }
 
 /// Where one change came from. Each connector implements this for its own position type
-/// (binlog file/position/GTID for MySQL, an LSN for PostgreSQL or SQL Server, …).
+/// (binlog file/position/GTID for `MySQL`, an LSN for PostgreSQL or SQL Server, …).
 pub trait SourceBlock {
     /// Debezium's `source.connector`, e.g. `mysql`.
     fn connector(&self) -> &'static str;

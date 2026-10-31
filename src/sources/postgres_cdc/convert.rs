@@ -57,7 +57,11 @@ const MICROS_PER_DAY: i64 = 86_400_000_000;
 const EPOCH: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
 /// Converts one column value (its text, or `None` for SQL `NULL`).
-pub fn convert(column: &Column, text: Option<&str>, options: &ConvertOptions) -> Result<Json, String> {
+pub fn convert(
+    column: &Column,
+    text: Option<&str>,
+    options: &ConvertOptions,
+) -> Result<Json, String> {
     match text {
         None => Ok(Json::Null),
         Some(text) => convert_kind(&column.ty.kind, column, text, options)
@@ -65,7 +69,12 @@ pub fn convert(column: &Column, text: Option<&str>, options: &ConvertOptions) ->
     }
 }
 
-fn convert_kind(kind: &Kind, column: &Column, text: &str, o: &ConvertOptions) -> Result<Json, String> {
+fn convert_kind(
+    kind: &Kind,
+    column: &Column,
+    text: &str,
+    o: &ConvertOptions,
+) -> Result<Json, String> {
     Ok(match kind {
         Kind::Bool => Json::Bool(match text {
             "t" | "true" => true,
@@ -73,9 +82,15 @@ fn convert_kind(kind: &Kind, column: &Column, text: &str, o: &ConvertOptions) ->
             _ => return Err(format!("not a boolean: `{text}`")),
         }),
         Kind::Int16 | Kind::Int32 | Kind::Int64 => {
-            json!(text.parse::<i64>().map_err(|_| format!("not an integer: `{text}`"))?)
+            json!(
+                text.parse::<i64>()
+                    .map_err(|_| format!("not an integer: `{text}`"))?
+            )
         }
-        Kind::Oid => json!(text.parse::<u64>().map_err(|_| format!("not an oid: `{text}`"))?),
+        Kind::Oid => json!(
+            text.parse::<u64>()
+                .map_err(|_| format!("not an oid: `{text}`"))?
+        ),
         Kind::Float32 | Kind::Float64 => float(text)?,
         Kind::Numeric => {
             let scale = column.numeric_precision_scale().map(|(_, s)| s);
@@ -93,7 +108,8 @@ fn convert_kind(kind: &Kind, column: &Column, text: &str, o: &ConvertOptions) ->
         }
         Kind::TimeTz => Json::from(timetz_utc(text)?),
         Kind::Timestamp => {
-            let millis = o.time_precision == TimePrecisionMode::Connect || column.time_precision() <= 3;
+            let millis =
+                o.time_precision == TimePrecisionMode::Connect || column.time_precision() <= 3;
             json!(timestamp(text, millis)?)
         }
         Kind::TimestampTz => Json::from(timestamptz_iso(text)?),
@@ -118,7 +134,9 @@ fn float(text: &str) -> Result<Json, String> {
     match text {
         "NaN" | "Infinity" | "-Infinity" => Ok(Json::from(text)),
         _ => {
-            let value: f64 = text.parse().map_err(|_| format!("not a number: `{text}`"))?;
+            let value: f64 = text
+                .parse()
+                .map_err(|_| format!("not a number: `{text}`"))?;
             Ok(json!(value))
         }
     }
@@ -133,21 +151,24 @@ fn decimal(text: &str, scale: Option<i32>, o: &ConvertOptions) -> Result<Json, S
             if special {
                 Json::from(text)
             } else {
-                json!(text.parse::<f64>().map_err(|_| format!("not a decimal: `{text}`"))?)
+                json!(
+                    text.parse::<f64>()
+                        .map_err(|_| format!("not a decimal: `{text}`"))?
+                )
             }
         }
         // Not representable as an unscaled integer (Debezium gives null too).
         DecimalHandlingMode::Precise if special => Json::Null,
         DecimalHandlingMode::Precise => {
             let (unscaled, text_scale) = unscaled(text)?;
-            match scale {
+            match scale.and_then(|scale| usize::try_from(scale).ok()) {
                 // A declared scale: the value always has exactly that many digits.
-                Some(scale) if scale >= 0 => {
-                    let unscaled = rescale(&unscaled, text_scale, scale as usize);
+                Some(scale) => {
+                    let unscaled = rescale(&unscaled, text_scale, scale);
                     Json::from(encode_bytes(&twos_complement(&unscaled), o.binary))
                 }
                 // Debezium's VariableScaleDecimal.
-                _ => json!({
+                None => json!({
                     "scale": text_scale,
                     "value": encode_bytes(&twos_complement(&unscaled), o.binary),
                 }),
@@ -184,7 +205,9 @@ fn rescale(unscaled: &str, from: usize, to: usize) -> String {
     if to >= from {
         format!("{unscaled}{}", "0".repeat(to - from))
     } else {
-        unscaled[..unscaled.len() - (from - to)].to_owned()
+        let mut narrowed = unscaled.to_owned();
+        narrowed.truncate(unscaled.len().saturating_sub(from - to));
+        narrowed
     }
 }
 
@@ -202,12 +225,16 @@ fn twos_complement(value: &str) -> Vec<u8> {
         let mut remainder: u32 = 0;
         let mut quotient = Vec::with_capacity(decimal.len());
         for &d in &decimal {
+            // remainder < 256, so acc < 2570 and acc / 256 <= 10.
             let acc = remainder * 10 + u32::from(d);
-            quotient.push((acc / 256) as u8);
+            quotient.push(u8::try_from(acc / 256).expect("quotient below 256"));
             remainder = acc % 256;
         }
-        magnitude.push(remainder as u8);
-        let first = quotient.iter().position(|&d| d != 0).unwrap_or(quotient.len());
+        magnitude.push(u8::try_from(remainder).expect("remainder below 256"));
+        let first = quotient
+            .iter()
+            .position(|&d| d != 0)
+            .unwrap_or(quotient.len());
         decimal = quotient.split_off(first);
     }
     if magnitude.is_empty() {
@@ -238,11 +265,18 @@ fn twos_complement(value: &str) -> Vec<u8> {
 /// digits and decimal point, then treat it as a decimal with `money_fraction_digits`.
 fn money(text: &str, o: &ConvertOptions) -> Result<Json, String> {
     let negative = text.contains('-') || (text.starts_with('(') && text.ends_with(')'));
-    let digits: String = text.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    let digits: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
     if digits.is_empty() {
         return Err(format!("not a money value: `{text}`"));
     }
-    let value = if negative { format!("-{digits}") } else { digits };
+    let value = if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    };
     decimal(&value, Some(i32::from(o.money_fraction_digits)), o)
 }
 
@@ -257,7 +291,9 @@ fn bytea(text: &str) -> Result<Vec<u8>, String> {
 pub fn encode_bytes(bytes: &[u8], mode: BinaryHandlingMode) -> String {
     match mode {
         BinaryHandlingMode::Base64 => base64::engine::general_purpose::STANDARD.encode(bytes),
-        BinaryHandlingMode::Base64UrlSafe => base64::engine::general_purpose::URL_SAFE.encode(bytes),
+        BinaryHandlingMode::Base64UrlSafe => {
+            base64::engine::general_purpose::URL_SAFE.encode(bytes)
+        }
         BinaryHandlingMode::Hex => hex::encode(bytes),
     }
 }
@@ -277,14 +313,14 @@ fn naive_date(text: &str) -> Result<NaiveDate, String> {
     let (Some(y), Some(m), Some(d)) = (parts.next(), parts.next(), parts.next()) else {
         return Err(format!("not a date: `{text}`"));
     };
-    let parse = |s: &str| s.parse::<i32>().map_err(|_| format!("not a date: `{text}`"));
-    let mut year = parse(y)?;
+    let bad = || format!("not a date: `{text}`");
+    let mut year = y.parse::<i32>().map_err(|_| bad())?;
     if bc {
         // 1 BC is year 0 (proleptic Gregorian).
         year = 1 - year;
     }
-    NaiveDate::from_ymd_opt(year, parse(m)? as u32, parse(d)? as u32)
-        .ok_or_else(|| format!("not a date: `{text}`"))
+    let part = |s: &str| s.parse::<u32>().map_err(|_| bad());
+    NaiveDate::from_ymd_opt(year, part(m)?, part(d)?).ok_or_else(|| format!("not a date: `{text}`"))
 }
 
 fn date_days(text: &str) -> Result<i64, String> {
@@ -318,32 +354,40 @@ fn time_micros(text: &str) -> Result<i64, String> {
 fn split_offset(text: &str) -> Result<(&str, i64), String> {
     let at = text
         .rfind(['+', '-'])
-        .filter(|&i| i > 0 && text[..i].contains(':'))
+        .filter(|&i| i > 0 && text.get(..i).is_some_and(|time| time.contains(':')))
         .ok_or_else(|| format!("no time zone offset in `{text}`"))?;
     let (rest, offset) = text.split_at(at);
     let sign = if offset.starts_with('-') { -1 } else { 1 };
     let mut seconds = 0;
-    for (i, part) in offset[1..].split(':').enumerate() {
-        let v: i64 = part.parse().map_err(|_| format!("bad offset in `{text}`"))?;
+    for (i, part) in offset
+        .strip_prefix(['+', '-'])
+        .unwrap_or(offset)
+        .split(':')
+        .enumerate()
+    {
+        let v: i64 = part
+            .parse()
+            .map_err(|_| format!("bad offset in `{text}`"))?;
         seconds += v * [3600, 60, 1].get(i).copied().unwrap_or(0);
     }
     Ok((rest, sign * seconds))
 }
 
-/// `timetz` as Debezium's ZonedTime: the time of day in UTC with a `Z`.
+/// `timetz` as Debezium's `ZonedTime`: the time of day in UTC with a `Z`.
 fn timetz_utc(text: &str) -> Result<String, String> {
     let (time, offset) = split_offset(text)?;
     let micros = (time_micros(time)? - offset * 1_000_000).rem_euclid(MICROS_PER_DAY);
-    let t = NaiveTime::from_num_seconds_from_midnight_opt(
-        (micros / 1_000_000) as u32,
-        ((micros % 1_000_000) * 1000) as u32,
-    )
-    .ok_or_else(|| format!("not a time: `{text}`"))?;
-    Ok(format!("{}Z", format_time(&t)))
+    let secs = u32::try_from(micros / 1_000_000).ok();
+    let nanos = u32::try_from((micros % 1_000_000) * 1000).ok();
+    let t = secs
+        .zip(nanos)
+        .and_then(|(secs, nanos)| NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos))
+        .ok_or_else(|| format!("not a time: `{text}`"))?;
+    Ok(format!("{}Z", format_time(t)))
 }
 
 /// `HH:MM:SS` plus as many fractional digits as the value has (up to 6).
-fn format_time(t: &NaiveTime) -> String {
+fn format_time(t: NaiveTime) -> String {
     let micros = t.nanosecond() / 1000;
     let base = t.format("%H:%M:%S").to_string();
     if micros == 0 {
@@ -359,10 +403,13 @@ fn naive_timestamp(text: &str) -> Result<NaiveDateTime, String> {
     let (date, time) = body
         .split_once(' ')
         .ok_or_else(|| format!("not a timestamp: `{text}`"))?;
-    let date = naive_date(&if bc { format!("{date} BC") } else { date.to_owned() })?;
+    let date = naive_date(&if bc {
+        format!("{date} BC")
+    } else {
+        date.to_owned()
+    })?;
     let micros = time_micros(time)?;
-    Ok(date.and_hms_opt(0, 0, 0).expect("midnight")
-        + chrono::Duration::microseconds(micros))
+    Ok(date.and_hms_opt(0, 0, 0).expect("midnight") + chrono::Duration::microseconds(micros))
 }
 
 /// `timestamp` as milliseconds or microseconds since the epoch.
@@ -372,20 +419,28 @@ fn timestamp(text: &str, millis: bool) -> Result<i64, String> {
         "-infinity" => return Ok(i64::MIN),
         _ => naive_timestamp(text)?.and_utc().timestamp_micros(),
     };
-    Ok(if millis { micros.div_euclid(1000) } else { micros })
+    Ok(if millis {
+        micros.div_euclid(1000)
+    } else {
+        micros
+    })
 }
 
-/// `timestamptz` (printed in UTC) as Debezium's ZonedTimestamp.
+/// `timestamptz` (printed in UTC) as Debezium's `ZonedTimestamp`.
 fn timestamptz_iso(text: &str) -> Result<String, String> {
     if text == "infinity" || text == "-infinity" {
         return Ok(text.to_owned());
     }
     let (body, bc) = era(text);
     let (local, offset) = split_offset(body)?;
-    let local = naive_timestamp(&if bc { format!("{local} BC") } else { local.to_owned() })?;
+    let local = naive_timestamp(&if bc {
+        format!("{local} BC")
+    } else {
+        local.to_owned()
+    })?;
     let utc = local - chrono::Duration::seconds(offset);
     let date = utc.date().format("%Y-%m-%d");
-    Ok(format!("{date}T{}Z", format_time(&utc.time())))
+    Ok(format!("{date}T{}Z", format_time(utc.time())))
 }
 
 /// An ISO-8601 interval (`IntervalStyle=iso_8601`, e.g. `P1Y2M3DT4H5M6.5S`, `P-1D`, `PT-0.5S`)
@@ -407,6 +462,10 @@ fn interval_micros(text: &str) -> Result<i64, String> {
             }
             let v: f64 = number.parse().map_err(|_| bad())?;
             number.clear();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "86_400_000_000 is exactly representable in f64"
+            )]
             let day = MICROS_PER_DAY as f64;
             total += v * match (units, c) {
                 ("YMWD", 'Y') => 12.0 * DAYS_PER_MONTH * day,
@@ -422,7 +481,12 @@ fn interval_micros(text: &str) -> Result<i64, String> {
             return Err(bad());
         }
     }
-    Ok(total.round() as i64)
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "`as` saturates; intervals beyond about 292,000 years cannot be represented anyway"
+    )]
+    let micros = total.round() as i64;
+    Ok(micros)
 }
 
 /// `bit(1)` as a boolean; longer bit strings as Debezium's `Bits`: bytes, least significant
@@ -449,8 +513,14 @@ fn point(text: &str) -> Result<Json, String> {
         .strip_prefix('(')
         .and_then(|t| t.strip_suffix(')'))
         .ok_or_else(|| format!("not a point: `{text}`"))?;
-    let (x, y) = inner.split_once(',').ok_or_else(|| format!("not a point: `{text}`"))?;
-    let n = |s: &str| s.trim().parse::<f64>().map_err(|_| format!("not a point: `{text}`"));
+    let (x, y) = inner
+        .split_once(',')
+        .ok_or_else(|| format!("not a point: `{text}`"))?;
+    let n = |s: &str| {
+        s.trim()
+            .parse::<f64>()
+            .map_err(|_| format!("not a point: `{text}`"))
+    };
     let mut map = Map::with_capacity(2);
     map.insert("x".into(), json!(n(x)?));
     map.insert("y".into(), json!(n(y)?));
@@ -468,7 +538,7 @@ enum Element {
 /// dimensions like `[0:1]=`) converted element by element.
 fn array(text: &str, element: &Kind, column: &Column, o: &ConvertOptions) -> Result<Json, String> {
     let body = match text.find("={") {
-        Some(i) if text.starts_with('[') => &text[i + 1..],
+        Some(i) if text.starts_with('[') => text.get(i + 1..).unwrap_or(text),
         _ => text,
     };
     let mut chars = body.chars().peekable();
@@ -476,7 +546,12 @@ fn array(text: &str, element: &Kind, column: &Column, o: &ConvertOptions) -> Res
     to_json(&parsed, element, column, o)
 }
 
-fn to_json(elements: &[Element], kind: &Kind, column: &Column, o: &ConvertOptions) -> Result<Json, String> {
+fn to_json(
+    elements: &[Element],
+    kind: &Kind,
+    column: &Column,
+    o: &ConvertOptions,
+) -> Result<Json, String> {
     elements
         .iter()
         .map(|e| match e {
@@ -528,7 +603,7 @@ fn parse_array(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<V
             }
         }
         match chars.next()? {
-            ',' => continue,
+            ',' => {}
             '}' => return Some(out),
             _ => return None,
         }
@@ -557,7 +632,10 @@ mod tests {
             position: 1,
             type_oid: 0,
             typmod,
-            ty: TypeInfo { name: "t".into(), kind },
+            ty: TypeInfo {
+                name: "t".into(),
+                kind,
+            },
             nullable: true,
             primary_key: None,
             excluded: false,
@@ -571,11 +649,17 @@ mod tests {
     #[test]
     fn scalars() {
         assert_eq!(conv(Kind::Bool, -1, "t"), json!(true));
-        assert_eq!(conv(Kind::Int64, -1, "-9223372036854775808"), json!(i64::MIN));
+        assert_eq!(
+            conv(Kind::Int64, -1, "-9223372036854775808"),
+            json!(i64::MIN)
+        );
         assert_eq!(conv(Kind::Float64, -1, "1.5"), json!(1.5));
         assert_eq!(conv(Kind::Float64, -1, "NaN"), json!("NaN"));
         assert_eq!(conv(Kind::Uuid, -1, "a0ee-1"), json!("a0ee-1"));
-        assert_eq!(convert(&col(Kind::Int32, -1), None, &options()).unwrap(), Json::Null);
+        assert_eq!(
+            convert(&col(Kind::Int32, -1), None, &options()).unwrap(),
+            Json::Null
+        );
         assert!(convert(&col(Kind::Int32, -1), Some("x"), &options()).is_err());
     }
 
@@ -597,8 +681,14 @@ mod tests {
         assert_eq!(conv(Kind::Numeric, -1, "NaN"), Json::Null);
         let mut o = options();
         o.decimal = DecimalHandlingMode::String;
-        assert_eq!(convert(&col(Kind::Numeric, -1), Some("NaN"), &o).unwrap(), json!("NaN"));
-        assert_eq!(convert(&col(Kind::Money, -1), Some("-$1,234.56"), &o).unwrap(), json!("-1234.56"));
+        assert_eq!(
+            convert(&col(Kind::Numeric, -1), Some("NaN"), &o).unwrap(),
+            json!("NaN")
+        );
+        assert_eq!(
+            convert(&col(Kind::Money, -1), Some("-$1,234.56"), &o).unwrap(),
+            json!("-1234.56")
+        );
     }
 
     #[test]
@@ -607,13 +697,25 @@ mod tests {
         assert_eq!(conv(Kind::Date, -1, "1969-12-31"), json!(-1));
         assert_eq!(conv(Kind::Date, -1, "infinity"), json!(i32::MAX));
         assert_eq!(conv(Kind::Date, -1, "0001-01-01 BC"), json!(-719_528));
-        assert_eq!(conv(Kind::Time, -1, "10:15:30.5"), json!(36_930_500_000_i64));
+        assert_eq!(
+            conv(Kind::Time, -1, "10:15:30.5"),
+            json!(36_930_500_000_i64)
+        );
         assert_eq!(conv(Kind::Time, -1, "24:00:00"), json!(86_400_000_000_i64));
-        assert_eq!(conv(Kind::TimeTz, -1, "10:15:30.123+02"), json!("08:15:30.123Z"));
+        assert_eq!(
+            conv(Kind::TimeTz, -1, "10:15:30.123+02"),
+            json!("08:15:30.123Z")
+        );
         assert_eq!(conv(Kind::TimeTz, -1, "01:00:00-03:30"), json!("04:30:00Z"));
         // timestamp(3) → millis, timestamp → micros.
-        assert_eq!(conv(Kind::Timestamp, 3, "1970-01-01 00:00:01.5"), json!(1500));
-        assert_eq!(conv(Kind::Timestamp, -1, "1970-01-01 00:00:01.5"), json!(1_500_000));
+        assert_eq!(
+            conv(Kind::Timestamp, 3, "1970-01-01 00:00:01.5"),
+            json!(1500)
+        );
+        assert_eq!(
+            conv(Kind::Timestamp, -1, "1970-01-01 00:00:01.5"),
+            json!(1_500_000)
+        );
         assert_eq!(conv(Kind::Timestamp, -1, "infinity"), json!(i64::MAX));
         assert_eq!(
             conv(Kind::TimestampTz, -1, "2024-05-01 10:15:30.123456+00"),
@@ -630,11 +732,20 @@ mod tests {
     fn intervals() {
         assert_eq!(conv(Kind::Interval, -1, "PT1.5S"), json!(1_500_000));
         assert_eq!(conv(Kind::Interval, -1, "P1D"), json!(86_400_000_000_i64));
-        assert_eq!(conv(Kind::Interval, -1, "P-1DT-1H"), json!(-90_000_000_000_i64));
-        assert_eq!(conv(Kind::Interval, -1, "P1M"), json!(2_629_800_000_000_i64));
+        assert_eq!(
+            conv(Kind::Interval, -1, "P-1DT-1H"),
+            json!(-90_000_000_000_i64)
+        );
+        assert_eq!(
+            conv(Kind::Interval, -1, "P1M"),
+            json!(2_629_800_000_000_i64)
+        );
         let mut o = options();
         o.interval = IntervalHandlingMode::String;
-        assert_eq!(convert(&col(Kind::Interval, -1), Some("P1Y2M"), &o).unwrap(), json!("P1Y2M"));
+        assert_eq!(
+            convert(&col(Kind::Interval, -1), Some("P1Y2M"), &o).unwrap(),
+            json!("P1Y2M")
+        );
     }
 
     #[test]
@@ -643,14 +754,20 @@ mod tests {
         assert_eq!(conv(Kind::Bit, 1, "1"), json!(true));
         // 0b1000000001 (10 bits): bit 0 and bit 9 → bytes [0x01, 0x02].
         assert_eq!(conv(Kind::VarBit, -1, "1000000001"), json!("AQI="));
-        assert_eq!(conv(Kind::Point, -1, "(1.5,-2)"), json!({"x": 1.5, "y": -2.0}));
+        assert_eq!(
+            conv(Kind::Point, -1, "(1.5,-2)"),
+            json!({"x": 1.5, "y": -2.0})
+        );
     }
 
     #[test]
     fn arrays() {
         let ints = Kind::Array(Box::new(Kind::Int32));
         assert_eq!(conv(ints.clone(), -1, "{1,2,NULL}"), json!([1, 2, null]));
-        assert_eq!(conv(ints.clone(), -1, "{{1,2},{3,4}}"), json!([[1, 2], [3, 4]]));
+        assert_eq!(
+            conv(ints.clone(), -1, "{{1,2},{3,4}}"),
+            json!([[1, 2], [3, 4]])
+        );
         assert_eq!(conv(ints.clone(), -1, "[0:1]={5,6}"), json!([5, 6]));
         assert_eq!(conv(ints, -1, "{}"), json!([]));
         let texts = Kind::Array(Box::new(Kind::Text));
@@ -658,7 +775,14 @@ mod tests {
             conv(texts, -1, r#"{a,"b c","d\"e","NULL",NULL}"#),
             json!(["a", "b c", "d\"e", "NULL", null])
         );
-        assert!(convert(&col(Kind::Array(Box::new(Kind::Int32)), -1), Some("{1,2"), &options()).is_err());
+        assert!(
+            convert(
+                &col(Kind::Array(Box::new(Kind::Int32)), -1),
+                Some("{1,2"),
+                &options()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -666,6 +790,9 @@ mod tests {
         assert_eq!(conv(Kind::Jsonb, -1, r#"{"a": 1}"#), json!(r#"{"a": 1}"#));
         let mut o = options();
         o.json = JsonHandlingMode::Object;
-        assert_eq!(convert(&col(Kind::Jsonb, -1), Some(r#"{"a": 1}"#), &o).unwrap(), json!({"a": 1}));
+        assert_eq!(
+            convert(&col(Kind::Jsonb, -1), Some(r#"{"a": 1}"#), &o).unwrap(),
+            json!({"a": 1})
+        );
     }
 }

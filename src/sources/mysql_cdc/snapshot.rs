@@ -1,4 +1,4 @@
-//! Consistent initial snapshot, modeled on Debezium's MySQL snapshot with
+//! Consistent initial snapshot, modeled on Debezium's `MySQL` snapshot with
 //! `snapshot.locking.mode=minimal`, optionally read by several connections in parallel:
 //!
 //! 1. `FLUSH TABLES WITH READ LOCK` (blocks writes for a moment);
@@ -61,7 +61,7 @@ const CHUNKABLE_TYPES: &[&str] = &[
     "bigint",
 ];
 
-/// Quotes a MySQL identifier.
+/// Quotes a `MySQL` identifier.
 pub fn quote_ident(ident: &str) -> String {
     format!("`{}`", ident.replace('`', "``"))
 }
@@ -114,9 +114,10 @@ fn plan_chunks(
     estimated_rows: u64,
     chunk_size: u64,
 ) -> Vec<(i64, Option<i64>)> {
-    let span = (i128::from(max) - i128::from(min) + 1).max(1) as u128;
+    let span =
+        u128::try_from((i128::from(max) - i128::from(min) + 1).max(1)).expect("span is at least 1");
     let rows = if estimated_rows == 0 {
-        span as u64
+        u64::try_from(span).unwrap_or(u64::MAX)
     } else {
         estimated_rows
     };
@@ -126,16 +127,18 @@ fn plan_chunks(
     if chunks <= 1 {
         return vec![(min, None)];
     }
-    let width = span.div_ceil(u128::from(chunks)).max(1);
-    let mut ranges = Vec::with_capacity(chunks as usize);
+    // width <= span <= 2^64, and every pushed bound lies within [min, max].
+    let width = i128::try_from(span.div_ceil(u128::from(chunks)).max(1)).expect("width fits i128");
+    let bound = |value: i128| i64::try_from(value).expect("chunk bound within [min, max]");
+    let mut ranges = Vec::with_capacity(usize::try_from(chunks).unwrap_or(0));
     let mut start = i128::from(min);
     loop {
-        let end = start + width as i128;
+        let end = start + width;
         if end > i128::from(max) {
-            ranges.push((start as i64, None));
+            ranges.push((bound(start), None));
             break;
         }
-        ranges.push((start as i64, Some(end as i64)));
+        ranges.push((bound(start), Some(bound(end))));
         start = end;
     }
     ranges
@@ -160,6 +163,10 @@ pub(super) async fn snapshot_connection(settings: &Settings) -> Result<Conn, Str
 }
 
 /// Runs the snapshot. Returns the offset to stream from, or `None` if shut down part-way.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the snapshot's phases (lock, plan, read, release) in order"
+)]
 pub(super) async fn run(
     settings: &Settings,
     server: &ServerInfo,
@@ -279,7 +286,7 @@ pub(super) async fn run(
         units_left[unit.table] += 1;
     }
     let total_units = units.len();
-    let plans = Arc::new(plans);
+    let plans: Arc<[TablePlan]> = Arc::from(plans);
     let queue = Arc::new(Mutex::new(units));
     let (tx, mut rx) = mpsc::channel::<Message>(threads * 4);
 
@@ -355,7 +362,7 @@ pub(super) async fn run(
                         emitter.push_snapshot_row(previous);
                     }
                     total_rows += 1;
-                    if total_rows % PROGRESS_INTERVAL == 0 {
+                    if total_rows.is_multiple_of(PROGRESS_INTERVAL) {
                         info!(
                             message = "Snapshot progress.",
                             rows = total_rows,
@@ -506,10 +513,9 @@ async fn chunk_ranges(
             k = quote_ident(key),
         ))
         .await;
-    let (min, max) = match bounds {
-        Ok(Some((Some(min), Some(max)))) => (min, max),
-        // Empty table, or keys outside the i64 range (BIGINT UNSIGNED): no chunking.
-        Ok(_) | Err(_) => return Ok(None),
+    // Empty table, or keys outside the i64 range (BIGINT UNSIGNED): no chunking.
+    let Ok(Some((Some(min), Some(max)))) = bounds else {
+        return Ok(None);
     };
     let estimated: Option<Option<u64>> = conn
         .exec_first(
@@ -525,7 +531,7 @@ async fn chunk_ranges(
 /// Reads units from the shared queue on its own connection until the queue is empty.
 struct Worker {
     conn: Conn,
-    plans: Arc<Vec<TablePlan>>,
+    plans: Arc<[TablePlan]>,
     queue: Arc<Mutex<VecDeque<Unit>>>,
     tx: mpsc::Sender<Message>,
     filters: Filters,
@@ -545,6 +551,10 @@ impl Worker {
         _ = self.conn.query_drop("COMMIT").await;
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a worker's read loop: query, convert and send each row"
+    )]
     async fn work(&mut self) -> Result<(), String> {
         loop {
             let unit = self.queue.lock().expect("snapshot queue lock").pop_front();
@@ -569,10 +579,11 @@ impl Worker {
                 quote_ident(&plan.table)
             );
             if let (Some((start, end)), Some(key)) = (unit.range, &plan.chunk_key) {
+                use std::fmt::Write as _;
                 let key = quote_ident(key);
-                query.push_str(&format!(" WHERE {key} >= {start}"));
+                write!(query, " WHERE {key} >= {start}").expect("writing to a String");
                 if let Some(end) = end {
-                    query.push_str(&format!(" AND {key} < {end}"));
+                    write!(query, " AND {key} < {end}").expect("writing to a String");
                 }
             }
             let context = || format!("snapshot: reading `{}`.`{}`", plan.database, plan.table);
@@ -592,7 +603,7 @@ impl Worker {
                 &columns,
                 &plan.details,
                 &self.filters,
-                &self.convert,
+                self.convert,
             ));
             if self
                 .tx
@@ -612,7 +623,7 @@ impl Worker {
                 .await
                 .map_err(|error| format!("{}: {error}", context()))?
             {
-                match convert_row(&info, row, &self.convert) {
+                match convert_row(&info, row, self.convert) {
                     Ok((after, key)) => {
                         let mut event = build_read(
                             &self.builder,
@@ -713,19 +724,19 @@ pub(super) async fn column_details(
                 let column_type_lower = column_type.to_ascii_lowercase();
                 let kind = data_type.to_ascii_lowercase();
                 let details = ColumnDetails {
-                    position: position as u32,
+                    position: u32::try_from(position).unwrap_or(u32::MAX),
                     nullable: is_nullable.eq_ignore_ascii_case("YES"),
                     unsigned: column_type_lower.contains("unsigned"),
                     precision: (kind == "decimal" || kind == "numeric")
-                        .then(|| precision.map(|p| p as u32))
+                        .then(|| precision.and_then(|p| u32::try_from(p).ok()))
                         .flatten(),
                     scale: (kind == "decimal" || kind == "numeric")
-                        .then(|| scale.map(|s| s as u32))
+                        .then(|| scale.and_then(|s| u32::try_from(s).ok()))
                         .flatten(),
                     fsp: fsp.map_or(0, |p| p.min(6) as u8),
                     bit_len: parse_bit_len(&column_type_lower).unwrap_or(0),
                     primary_key: key.as_deref() == Some("PRI"),
-                    values: table_schema::parse_value_list(&column_type).map(Arc::new),
+                    values: table_schema::parse_value_list(&column_type).map(Arc::from),
                     data_type,
                 };
                 (name, details)
@@ -738,7 +749,7 @@ pub(super) async fn column_details(
 pub(super) fn convert_row(
     info: &TableInfo,
     row: Row,
-    convert: &ConvertOptions,
+    convert: ConvertOptions,
 ) -> Result<(Image, Option<Image>), String> {
     let values = row.unwrap();
     let mut after = Map::with_capacity(values.len());

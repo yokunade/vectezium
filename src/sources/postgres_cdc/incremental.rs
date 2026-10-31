@@ -1,5 +1,5 @@
 //! Incremental (chunked) snapshots, read while the slot streams: the read-only watermark
-//! algorithm of Debezium's PostgreSQL connector (DBLog), with a transaction snapshot as the
+//! algorithm of Debezium's PostgreSQL connector (`DBLog`), with a transaction snapshot as the
 //! watermark.
 //!
 //! Each chunk of a table is read in one short `REPEATABLE READ` transaction, in key order:
@@ -135,6 +135,10 @@ pub enum Chunk {
 }
 
 /// Reads the next chunk of `table` after `last_key`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "builds and runs one chunk query as the watermark algorithm needs"
+)]
 pub async fn read_chunk(
     client: &Client,
     settings: &Settings,
@@ -181,7 +185,10 @@ pub async fn read_chunk(
     );
 
     let fail = |error: pgrepl_tokio_postgres::Error| {
-        format!("failed to read a chunk of {qualified}: {}", error_text(&error))
+        format!(
+            "failed to read a chunk of {qualified}: {}",
+            error_text(&error)
+        )
     };
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -245,7 +252,11 @@ pub async fn read_chunk(
         rows,
         index,
         // A chunk with no rows leaves the position where it was.
-        last_key: if read { last } else { last_key.map(<[String]>::to_vec) },
+        last_key: if read {
+            last
+        } else {
+            last_key.map(<[String]>::to_vec)
+        },
         complete: fetched < chunk_size,
     })))
 }
@@ -257,7 +268,14 @@ mod tests {
     #[test]
     fn parses_snapshots() {
         let s: PgSnapshot = "740:745:740,742".parse().unwrap();
-        assert_eq!(s, PgSnapshot { xmin: 740, xmax: 745, xip: vec![740, 742] });
+        assert_eq!(
+            s,
+            PgSnapshot {
+                xmin: 740,
+                xmax: 745,
+                xip: vec![740, 742]
+            }
+        );
         let s: PgSnapshot = "750:750:".parse().unwrap();
         assert!(s.xip.is_empty());
         assert!("750:750".parse::<PgSnapshot>().is_err());
@@ -275,13 +293,24 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::decimal_bitwise_operands,
+        reason = "epochs and xids read best in decimal"
+    )]
     fn widening_across_epochs() {
         let reference = (3_u64 << 32) | 10;
         assert_eq!(widen(5, reference), (3 << 32) | 5);
         assert_eq!(widen(20, reference), (3 << 32) | 20);
         // Just before the epoch boundary: the previous epoch.
-        assert_eq!(widen(u32::MAX - 5, reference), (2 << 32) | u64::from(u32::MAX - 5));
-        let s = PgSnapshot { xmin: (3 << 32) | 2, xmax: (3 << 32) | 12, xip: vec![] };
+        assert_eq!(
+            widen(u32::MAX - 5, reference),
+            (2 << 32) | u64::from(u32::MAX - 5)
+        );
+        let s = PgSnapshot {
+            xmin: (3 << 32) | 2,
+            xmax: (3 << 32) | 12,
+            xip: vec![],
+        };
         assert!(s.visible(u32::MAX - 5));
         assert!(!s.visible(12));
     }

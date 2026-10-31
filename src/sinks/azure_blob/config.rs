@@ -406,6 +406,10 @@ pub struct ValidatedAzureBlob {
 impl ValidatedSink for AzureBlobSinkConfig {
     type Validated = ValidatedAzureBlob;
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one check per option, in the order the options are documented"
+    )]
     fn validate(&self) -> crate::Result<ValidatedAzureBlob> {
         self.encoding.validate()?;
         if self.blob_type == AzureBlobType::Append && !supports_append(self.compression) {

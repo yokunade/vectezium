@@ -5,6 +5,7 @@
 /// Change events (from the transaction log) have position 0 and advance the counter by one each,
 /// so their numbers are identical on every replay; snapshot-derived events take the current
 /// counter and the next position. Fixed width, so it sorts correctly as text.
+#[must_use]
 pub fn master_seq(counter: u64, position: u64) -> String {
     format!("{counter:020}.{position:010}")
 }
@@ -32,7 +33,7 @@ mod tests {
                 (u64::MAX, 9_999_999_999),
                 (9, 1),
             ];
-            v.sort();
+            v.sort_unstable();
             v.into_iter()
                 .map(|(a, b)| master_seq(a, b))
                 .collect::<Vec<_>>()

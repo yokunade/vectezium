@@ -103,7 +103,7 @@ pub(super) async fn stream(
                 emitter.flush().await?;
                 handler.reset_connection_state();
 
-                if started.elapsed() > Duration::from_secs(60) {
+                if started.elapsed() > Duration::from_mins(1) {
                     backoff = MIN_BACKOFF;
                 }
                 tokio::select! {
@@ -272,6 +272,7 @@ impl<'a> Handler<'a> {
         self.last_start_pos = self.position.pos;
     }
 
+    #[allow(clippy::too_many_lines, reason = "one arm per binlog event type")]
     fn handle(&mut self, event: &Event, emitter: &mut Emitter) -> Result<(), String> {
         let header = event.header();
         let log_pos = u64::from(header.log_pos());
@@ -393,7 +394,7 @@ impl<'a> Handler<'a> {
                         let info = TableInfo::from_table_map(
                             tme.into_owned(),
                             &self.settings.filters,
-                            &self.settings.convert,
+                            self.settings.convert,
                         )
                         .map_err(|error| {
                             format!("invalid table map for `{database}`.`{table}`: {error}")
@@ -421,6 +422,10 @@ impl<'a> Handler<'a> {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the three row-event kinds share their bookkeeping"
+    )]
     fn rows(
         &mut self,
         rows: &RowsEventData<'_>,
@@ -569,7 +574,7 @@ impl<'a> Handler<'a> {
             let Some(value) = row.as_ref(index) else {
                 continue;
             };
-            let json = convert_binlog_value(desc, value, &self.settings.convert)
+            let json = convert_binlog_value(desc, value, self.settings.convert)
                 .map_err(|error| error.to_string())?;
             if desc.primary_key {
                 key.insert(desc.name.clone(), json.clone());
@@ -856,7 +861,7 @@ impl<'a> Handler<'a> {
     }
 
     /// Not inside a transaction (incremental snapshot chunks are only emitted here).
-    fn between_transactions(&self) -> bool {
+    const fn between_transactions(&self) -> bool {
         !self.tx.in_tx && self.tx.gtid.is_none()
     }
 }

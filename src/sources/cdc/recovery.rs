@@ -54,6 +54,10 @@ pub struct OffsetRecoveryConfig {
 
 impl OffsetRecoveryConfig {
     /// Checks the settings against the lock, whose client reads the lake (no I/O).
+    ///
+    /// # Errors
+    ///
+    /// Fails without `single_writer_lock`, or if `latest_blob` or `folder` is empty.
     pub fn build(&self, lock: Option<&LockClient>) -> Result<OffsetRecovery, String> {
         let lock = lock.ok_or(
             "`offset_recovery` needs `single_writer_lock`: the folder must not change while it is \
@@ -111,6 +115,11 @@ pub struct OffsetRecovery {
 impl OffsetRecovery {
     /// Reads the published offset, or checks that the folder is empty. Read errors are retried
     /// until the lake answers; `None` means shutdown was requested first.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the published offset cannot be parsed, or if the folder holds data but no
+    /// published offset.
     pub async fn recover(
         &self,
         connector: &str,
@@ -166,6 +175,10 @@ impl OffsetRecovery {
 
     /// The tables with a `snapshot_completed` event of `connector` under `control_prefix`.
     /// `None` means shutdown was requested first.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `control_prefix` is not set. Read errors are logged and retried.
     pub async fn snapshotted_tables(
         &self,
         connector: &str,
