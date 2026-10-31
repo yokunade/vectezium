@@ -352,8 +352,9 @@ signals:
 ```
 
 Write a file to `<folder>/pending/` (write it under a name starting with `.` or ending in
-`.tmp`, then rename it, so it is never read half-written). Files are applied in name order, so
-start names with a timestamp:
+`.tmp`, then rename it, so it is never read half-written). Signals are applied in the order
+they were written (by modification time, which a rename keeps; then by name), whatever they are
+called:
 
 ```json
 {"id": "8f0c…", "type": "execute-snapshot",
@@ -372,7 +373,8 @@ include and exclude lists). To capture a new table, add it to the include list a
 with `snapshot_new_tables: true` it is snapshotted on start.
 
 Within `poll_interval_secs` the source applies each signal between transactions, commits an
-offset recording it (`last_signal`), and moves the file to `<folder>/processed/` with its
+offset recording it (`last_signal`), and moves the file to `<folder>/processed/`, named
+`<seq>-<name>` with a 12-digit sequence number in the order signals were applied, with its
 result added:
 
 ```json
@@ -380,9 +382,9 @@ result added:
 ```
 
 A rejected signal (unknown type, a table that is not captured, invalid JSON) is moved there too,
-with `"status": "rejected"` and the reason; every signal is also logged. The newest 200 processed
+with `"status": "rejected"` and the reason; every signal is also logged. The latest 200 processed
 files are kept. If the source stops before the offset recording a signal is stored, it applies
-the signals in `processed/` after its stored `last_signal` again at the next start; applying a
+the signals in `processed/` numbered after its stored `last_signal` again at the next start; applying a
 signal twice does the same as applying it once. (An approval is not applied again: it is only
 good for the start it was given to.)
 

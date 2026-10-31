@@ -91,11 +91,10 @@ pub(super) async fn stream(
     position: StreamPosition,
     mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
-    let mut spool = settings
-        .signals
-        .as_ref()
-        .map(|config| Spool::open(config, position.last_signal.as_deref()))
-        .transpose()?;
+    let mut spool = match &settings.signals {
+        Some(config) => Some(Spool::open(config, position.last_signal.as_deref()).await?),
+        None => None,
+    };
     let mut handler = Handler::new(settings, server, position);
     let mut backoff = MIN_BACKOFF;
 
@@ -230,14 +229,12 @@ async fn run_connection(
         if let Some(spool) = spool.as_deref_mut()
             && handler.between_transactions()
         {
-            let done = signal::apply_due(spool, handler);
+            let done = signal::apply_due(spool, handler).await;
             if !done.is_empty() {
                 handler.last_signal = signal::last_signal(&done);
                 handler.commit_progress(emitter);
                 emitter.flush().await.map_err(StreamError::Fatal)?;
-                for (received, outcome) in &done {
-                    spool.finish(received, outcome);
-                }
+                spool.finish(done).await;
             }
         }
 
