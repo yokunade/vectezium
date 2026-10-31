@@ -586,13 +586,15 @@ pub(super) enum SlotState {
     Lost,
     /// In use by another connection.
     Active(i32),
-    Usable,
+    /// Streamable from its `confirmed_flush_lsn` on: the server has released the WAL before it.
+    Usable(Lsn),
 }
 
 pub(super) async fn slot_state(client: &Client, settings: &Settings) -> Result<SlotState, String> {
     let row = client
         .query_opt(
-            "SELECT coalesce(wal_status, ''), active_pid, plugin::text, database::text \
+            "SELECT coalesce(wal_status, ''), active_pid, plugin::text, database::text, \
+                    coalesce(confirmed_flush_lsn, '0/0')::text \
              FROM pg_replication_slots WHERE slot_name = $1",
             &[&settings.slot_name],
         )
@@ -624,7 +626,7 @@ pub(super) async fn slot_state(client: &Client, settings: &Settings) -> Result<S
     Ok(match (wal_status.as_str(), active) {
         ("lost", _) => SlotState::Lost,
         (_, Some(pid)) => SlotState::Active(pid),
-        _ => SlotState::Usable,
+        _ => SlotState::Usable(row.get::<_, String>(4).parse()?),
     })
 }
 
@@ -790,14 +792,22 @@ async fn run(
                     offset.slot_name, settings.slot_name
                 ));
             }
-            if slot == SlotState::Usable {
-                Some(offset.clone())
-            } else {
-                let why = if slot == SlotState::Lost {
-                    "was invalidated (it fell more than `max_slot_wal_keep_size` behind)"
-                } else {
-                    "no longer exists"
-                };
+            let why = match slot {
+                SlotState::Usable(confirmed) if confirmed <= offset.lsn => None,
+                // The server would silently stream from its own, later position. Offsets only
+                // release WAL once stored (or published and delivered), so the offset is older
+                // than one this source had: for example, an offset recovered from a lake that
+                // lagged behind.
+                SlotState::Usable(confirmed) => Some(format!(
+                    "has already released the WAL after the offset (its confirmed_flush_lsn \
+                     {confirmed} is past it)"
+                )),
+                SlotState::Lost => Some(
+                    "was invalidated (it fell more than `max_slot_wal_keep_size` behind)".into(),
+                ),
+                SlotState::Missing | SlotState::Active(_) => Some("no longer exists".into()),
+            };
+            if let Some(why) = why {
                 if settings.snapshot_mode != SnapshotMode::WhenNeeded {
                     return Err(format!(
                         "replication slot `{}` {why}, so changes after {offset} are lost. Set \
@@ -824,8 +834,10 @@ async fn run(
                         return emitter.close().await;
                     }
                 }
-                warn!(message = "The replication slot was lost; re-snapshotting.", slot = %settings.slot_name, %why);
+                warn!(message = "The replication slot cannot resume from the offset; re-snapshotting.", slot = %settings.slot_name, %why);
                 None
+            } else {
+                Some(offset.clone())
             }
         }
         Some(_) => {
