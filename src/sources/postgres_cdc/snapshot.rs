@@ -69,7 +69,9 @@ pub(super) async fn run(
             error_text(&error)
         )
     })?;
-    let row = created.first().ok_or("CREATE_REPLICATION_SLOT returned nothing")?;
+    let row = created
+        .first()
+        .ok_or("CREATE_REPLICATION_SLOT returned nothing")?;
     let lsn: Lsn = row
         .get(1)
         .cloned()
@@ -111,7 +113,12 @@ pub(super) async fn run(
                 snapshot_name.replace('\'', "''")
             ))
             .await
-            .map_err(|error| format!("failed to import the slot's snapshot: {}", error_text(&error)))?;
+            .map_err(|error| {
+                format!(
+                    "failed to import the slot's snapshot: {}",
+                    error_text(&error)
+                )
+            })?;
         readers.push(client);
     }
     drop(repl);
@@ -145,7 +152,17 @@ pub(super) async fn run(
         );
         let snapshot_id = snapshot_id.clone();
         tasks.push(tokio::spawn(async move {
-            let result = read_tables(&client, &queue, &tx, &tables, &settings, builder, lsn, &snapshot_id).await;
+            let result = read_tables(
+                &client,
+                &queue,
+                &tx,
+                &tables,
+                &settings,
+                builder,
+                lsn,
+                &snapshot_id,
+            )
+            .await;
             if let Err(error) = result {
                 _ = tx.send(Read::Failed(error)).await;
             }
@@ -160,7 +177,8 @@ pub(super) async fn run(
     let mut first = true;
     let mut done_tables = 0;
     let mut rows_total = 0u64;
-    let mark = |event: &mut LogEvent, marker: SnapshotMarker| builder.set_snapshot_marker(event, marker);
+    let mark =
+        |event: &mut LogEvent, marker: SnapshotMarker| builder.set_snapshot_marker(event, marker);
     loop {
         let read = tokio::select! {
             _ = &mut shutdown => {
@@ -238,7 +256,10 @@ pub(super) async fn run(
     // 4. Done: stream from the consistent point.
     let mut offset = Offset::new(lsn, &settings.slot_name, Some(system_id.to_owned()));
     offset.snapshot_completed = true;
-    offset.snapshotted_tables = tables.iter().map(|t| (t.schema.clone(), t.table.clone())).collect();
+    offset.snapshotted_tables = tables
+        .iter()
+        .map(|t| (t.schema.clone(), t.table.clone()))
+        .collect();
     emitter.commit(offset.clone());
     emitter.flush().await?;
     emitter.set_batch_size(previous_batch);
@@ -271,7 +292,9 @@ async fn read_tables(
             .collect::<Vec<_>>()
             .join(", ");
         client
-            .batch_execute(&format!("DECLARE vtz_snapshot NO SCROLL CURSOR FOR SELECT {columns} FROM {name}"))
+            .batch_execute(&format!(
+                "DECLARE vtz_snapshot NO SCROLL CURSOR FOR SELECT {columns} FROM {name}"
+            ))
             .await
             .map_err(|error| format!("failed to read {name}: {}", error_text(&error)))?;
         let fetch = format!("FETCH {} FROM vtz_snapshot", settings.fetch_size);
@@ -303,7 +326,8 @@ async fn read_tables(
                     Some(lsn),
                     None,
                 );
-                let mut event = row_event(&builder, info, Op::Read, None, Some(after), &source, now);
+                let mut event =
+                    row_event(&builder, info, Op::Read, None, Some(after), &source, now);
                 builder.set_snapshot_id(&mut event, snapshot_id);
                 rows += 1;
                 if tx.send(Read::Row(index, event)).await.is_err() {

@@ -28,6 +28,8 @@ mod aws_kinesis_firehose;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 mod aws_sqs;
 mod batch;
+#[cfg(any(feature = "sources-mysql_cdc", feature = "sources-postgres_cdc"))]
+mod cdc;
 mod common;
 mod conditions;
 #[cfg(feature = "sources-datadog_agent")]
@@ -104,6 +106,8 @@ mod metric_to_log;
 mod mongodb_metrics;
 #[cfg(feature = "sinks-mqtt")]
 mod mqtt;
+#[cfg(feature = "sources-mysql_cdc")]
+mod mysql_cdc;
 #[cfg(feature = "sources-nginx_metrics")]
 mod nginx_metrics;
 mod open;
@@ -113,10 +117,6 @@ mod open;
     feature = "sinks-datadog_events",
 ))]
 mod parser;
-#[cfg(any(feature = "sources-mysql_cdc", feature = "sources-postgres_cdc"))]
-mod cdc;
-#[cfg(feature = "sources-mysql_cdc")]
-mod mysql_cdc;
 #[cfg(feature = "sources-postgres_cdc")]
 mod postgres_cdc;
 #[cfg(feature = "sources-postgresql_metrics")]
@@ -196,6 +196,8 @@ pub(crate) use self::aws_kinesis::*;
 pub(crate) use self::aws_kinesis_firehose::*;
 #[cfg(any(feature = "sources-aws_s3", feature = "sources-aws_sqs",))]
 pub(crate) use self::aws_sqs::*;
+#[cfg(any(feature = "sources-mysql_cdc", feature = "sources-postgres_cdc"))]
+pub(crate) use self::cdc::*;
 #[cfg(feature = "sources-datadog_agent")]
 pub(crate) use self::datadog_agent::*;
 #[cfg(feature = "sinks-datadog_logs")]
@@ -262,6 +264,8 @@ pub(crate) use self::lua::*;
 pub(crate) use self::metric_to_log::*;
 #[cfg(feature = "sinks-mqtt")]
 pub(crate) use self::mqtt::*;
+#[cfg(feature = "sources-mysql_cdc")]
+pub(crate) use self::mysql_cdc::*;
 #[cfg(feature = "sources-nginx_metrics")]
 pub(crate) use self::nginx_metrics::*;
 #[cfg(any(
@@ -270,10 +274,6 @@ pub(crate) use self::nginx_metrics::*;
     feature = "sinks-datadog_events",
 ))]
 pub(crate) use self::parser::*;
-#[cfg(any(feature = "sources-mysql_cdc", feature = "sources-postgres_cdc"))]
-pub(crate) use self::cdc::*;
-#[cfg(feature = "sources-mysql_cdc")]
-pub(crate) use self::mysql_cdc::*;
 #[cfg(feature = "sources-postgres_cdc")]
 pub(crate) use self::postgres_cdc::*;
 #[cfg(feature = "sources-postgresql_metrics")]

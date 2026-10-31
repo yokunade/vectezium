@@ -31,8 +31,12 @@ fn logical_type(kind: &Kind, column: &Column, o: &ConvertOptions) -> &'static st
         Kind::Float64 => "float64",
         Kind::Numeric | Kind::Money => match o.decimal {
             DecimalHandlingMode::Double => "float64",
-            _ if column.numeric_precision_scale().is_none() && kind == &Kind::Numeric
-                && o.decimal == DecimalHandlingMode::Precise => "variable_scale_decimal",
+            _ if column.numeric_precision_scale().is_none()
+                && kind == &Kind::Numeric
+                && o.decimal == DecimalHandlingMode::Precise =>
+            {
+                "variable_scale_decimal"
+            }
             _ => "decimal",
         },
         Kind::Bytea => "bytes",
@@ -69,8 +73,14 @@ fn logical_type(kind: &Kind, column: &Column, o: &ConvertOptions) -> &'static st
 
 fn json_type(logical: &str, o: &ConvertOptions) -> &'static str {
     match logical {
-        "int32" | "int64" | "date_days" | "time_micros" | "time_millis"
-        | "timestamp_micros_local" | "timestamp_millis_local" | "duration_micros" => "integer",
+        "int32"
+        | "int64"
+        | "date_days"
+        | "time_micros"
+        | "time_millis"
+        | "timestamp_micros_local"
+        | "timestamp_millis_local"
+        | "duration_micros" => "integer",
         "float32" | "float64" => "number",
         "boolean" => "boolean",
         "array" => "array",
@@ -107,7 +117,10 @@ fn column_json(column: &Column, o: &ConvertOptions) -> Json {
     if column.ty.kind == Kind::Money {
         c.insert("scale".into(), json!(o.money_fraction_digits));
     }
-    if matches!(column.ty.kind, Kind::Time | Kind::TimeTz | Kind::Timestamp | Kind::TimestampTz) {
+    if matches!(
+        column.ty.kind,
+        Kind::Time | Kind::TimeTz | Kind::Timestamp | Kind::TimestampTz
+    ) {
         c.insert("fsp".into(), json!(column.time_precision()));
     }
     if let Some(bits) = column.bit_length() {
@@ -233,7 +246,10 @@ mod tests {
             position: 1,
             type_oid: 0,
             typmod,
-            ty: TypeInfo { name: "x".into(), kind },
+            ty: TypeInfo {
+                name: "x".into(),
+                kind,
+            },
             nullable: pk.is_none(),
             primary_key: pk,
             excluded: false,
@@ -252,10 +268,16 @@ mod tests {
         assert_eq!(a["columns"][1]["logical_type"], json!("decimal"));
         let v = version(&a);
         assert_eq!(v.len(), 16);
-        assert_eq!(v, version(&core("public", "orders", &columns, &[0], &options())));
+        assert_eq!(
+            v,
+            version(&core("public", "orders", &columns, &[0], &options()))
+        );
         let mut other = options();
         other.decimal = DecimalHandlingMode::Precise;
-        assert_ne!(v, version(&core("public", "orders", &columns, &[0], &other)));
+        assert_ne!(
+            v,
+            version(&core("public", "orders", &columns, &[0], &other))
+        );
     }
 
     #[test]

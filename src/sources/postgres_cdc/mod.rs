@@ -663,8 +663,7 @@ mod tests {
 
     #[test]
     fn outputs_include_control_and_optional_ports() {
-        let mut config: PostgresCdcConfig =
-            serde_yaml::from_str("user: u\ndatabase: d").unwrap();
+        let mut config: PostgresCdcConfig = serde_yaml::from_str("user: u\ndatabase: d").unwrap();
         assert_eq!(config.outputs(LogNamespace::Legacy).len(), 2);
         config.include_table_schemas = true;
         config.publish_offsets = true;

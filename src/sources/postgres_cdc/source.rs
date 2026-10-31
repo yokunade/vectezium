@@ -110,11 +110,19 @@ impl Settings {
         match self.failure_mode {
             EventProcessingFailureHandlingMode::Fail => {
                 let message = format!("failed to convert a change in {schema}.{table}: {error}");
-                emit!(PostgresCdcDecodeError { error, schema, table });
+                emit!(PostgresCdcDecodeError {
+                    error,
+                    schema,
+                    table
+                });
                 Err(message)
             }
             EventProcessingFailureHandlingMode::Warn => {
-                emit!(PostgresCdcDecodeError { error, schema, table });
+                emit!(PostgresCdcDecodeError {
+                    error,
+                    schema,
+                    table
+                });
                 Ok(())
             }
             EventProcessingFailureHandlingMode::Skip => {
@@ -246,17 +254,22 @@ pub(super) async fn build(config: &PostgresCdcConfig, cx: SourceContext) -> crat
     let valid_name = |s: &str| {
         !s.is_empty()
             && s.len() <= 63
-            && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     };
     if config.snapshot_strategy == SnapshotStrategy::Incremental
         && config.snapshot_mode == SnapshotMode::InitialOnly
     {
-        return Err("`snapshot_strategy: incremental` reads tables while streaming, so it cannot be \
+        return Err(
+            "`snapshot_strategy: incremental` reads tables while streaming, so it cannot be \
                     combined with `snapshot_mode: initial_only`"
-            .into());
+                .into(),
+        );
     }
     if !valid_name(&config.slot_name) {
-        return Err("`slot_name` may only contain lower-case letters, digits and `_` (at most 63)".into());
+        return Err(
+            "`slot_name` may only contain lower-case letters, digits and `_` (at most 63)".into(),
+        );
     }
 
     let filters = Filters::new(
@@ -424,7 +437,9 @@ async fn inspect_server(client: &Client, settings: &Settings) -> Result<String, 
     let wal_level: String = row.get(1);
     let version: String = row.get(2);
     if version_num < 130_000 {
-        return Err(format!("PostgreSQL 13 or newer is required (the server is {version})"));
+        return Err(format!(
+            "PostgreSQL 13 or newer is required (the server is {version})"
+        ));
     }
     if wal_level != "logical" {
         return Err(format!(
@@ -434,7 +449,12 @@ async fn inspect_server(client: &Client, settings: &Settings) -> Result<String, 
     let repl = settings.conn.connect(true).await?;
     let ident = simple_rows(&repl, "IDENTIFY_SYSTEM")
         .await
-        .map_err(|error| format!("IDENTIFY_SYSTEM failed (does the user have the REPLICATION attribute?): {}", error_text(&error)))?;
+        .map_err(|error| {
+            format!(
+                "IDENTIFY_SYSTEM failed (does the user have the REPLICATION attribute?): {}",
+                error_text(&error)
+            )
+        })?;
     let system_id = ident
         .first()
         .and_then(|row| row.first().cloned().flatten())
@@ -466,7 +486,9 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
                      `disabled`: create it (CREATE PUBLICATION {name} FOR TABLE …)"
                 ));
             }
-            PublicationAutocreateMode::AllTables => format!("CREATE PUBLICATION {} FOR ALL TABLES", quote_ident(name)),
+            PublicationAutocreateMode::AllTables => {
+                format!("CREATE PUBLICATION {} FOR ALL TABLES", quote_ident(name))
+            }
             PublicationAutocreateMode::Filtered => {
                 if wanted.is_empty() {
                     return Err(format!(
@@ -479,13 +501,18 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
                     .map(|(s, t)| format!("{}.{}", quote_ident(s), quote_ident(t)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("CREATE PUBLICATION {} FOR TABLE {tables}", quote_ident(name))
+                format!(
+                    "CREATE PUBLICATION {} FOR TABLE {tables}",
+                    quote_ident(name)
+                )
             }
         };
-        client
-            .batch_execute(&sql)
-            .await
-            .map_err(|error| format!("failed to create publication `{name}`: {}", error_text(&error)))?;
+        client.batch_execute(&sql).await.map_err(|error| {
+            format!(
+                "failed to create publication `{name}`: {}",
+                error_text(&error)
+            )
+        })?;
         info!(message = "Created the publication.", publication = %name, tables = wanted.len());
         return Ok(());
     }
@@ -560,13 +587,24 @@ pub(super) async fn slot_state(client: &Client, settings: &Settings) -> Result<S
             &[&settings.slot_name],
         )
         .await
-        .map_err(|error| format!("failed to read pg_replication_slots: {}", error_text(&error)))?;
+        .map_err(|error| {
+            format!(
+                "failed to read pg_replication_slots: {}",
+                error_text(&error)
+            )
+        })?;
     let Some(row) = row else {
         return Ok(SlotState::Missing);
     };
-    let (wal_status, active, plugin, database): (String, Option<i32>, Option<String>, Option<String>) =
-        (row.get(0), row.get(1), row.get(2), row.get(3));
-    if plugin.as_deref() != Some("pgoutput") || database.as_deref() != Some(settings.database.as_str()) {
+    let (wal_status, active, plugin, database): (
+        String,
+        Option<i32>,
+        Option<String>,
+        Option<String>,
+    ) = (row.get(0), row.get(1), row.get(2), row.get(3));
+    if plugin.as_deref() != Some("pgoutput")
+        || database.as_deref() != Some(settings.database.as_str())
+    {
         return Err(format!(
             "replication slot `{}` exists but is not a pgoutput slot of database `{}`; choose \
              another `slot_name`",
@@ -616,7 +654,10 @@ async fn run(
     if stored.is_none()
         && let Some(recovery) = &recovery
     {
-        let Some(recovered) = recovery.recover(&settings.topic_prefix, &mut shutdown).await? else {
+        let Some(recovered) = recovery
+            .recover(&settings.topic_prefix, &mut shutdown)
+            .await?
+        else {
             return Ok(());
         };
         if let Recovered::Published(payload) = recovered {
@@ -631,13 +672,14 @@ async fn run(
                 offset = %offset,
                 next_seq = offset.next_seq,
             );
-            store
-                .store(&offset)
-                .await
-                .map_err(|error| format!("failed to store the recovered offset in {offset_file}: {error}"))?;
+            store.store(&offset).await.map_err(|error| {
+                format!("failed to store the recovered offset in {offset_file}: {error}")
+            })?;
             stored = Some(offset);
         } else {
-            info!(message = "No stored offset and the connector's folder in the lake is empty; starting from scratch.");
+            info!(
+                message = "No stored offset and the connector's folder in the lake is empty; starting from scratch."
+            );
         }
     }
 
@@ -647,7 +689,8 @@ async fn run(
     let system_id = inspect_server(&query, &settings).await?;
     let mut registry = TypeRegistry::load(&query).await?;
     ensure_publication(&query, &settings).await?;
-    let captured = catalog::captured_tables(&query, &settings.publication_name, &settings.filters).await?;
+    let captured =
+        catalog::captured_tables(&query, &settings.publication_name, &settings.filters).await?;
     if captured.is_empty() {
         warn!(
             message = "No captured tables: the publication streams no table the include lists match.",
@@ -748,7 +791,9 @@ async fn run(
                         settings.slot_name
                     ));
                 }
-                if settings.unplanned_snapshots == UnplannedSnapshots::Hold && !offset.resnapshot_approved {
+                if settings.unplanned_snapshots == UnplannedSnapshots::Hold
+                    && !offset.resnapshot_approved
+                {
                     return Err(format!(
                         "replication slot `{}` {why}, so every captured table would be \
                          snapshotted again. `unplanned_snapshots` is `hold`: approve the \
@@ -793,7 +838,9 @@ async fn run(
                     return emitter.close().await;
                 };
                 if settings.snapshot_mode == SnapshotMode::InitialOnly {
-                    info!(message = "Snapshot complete; `snapshot_mode` is `initial_only`, so not streaming.");
+                    info!(
+                        message = "Snapshot complete; `snapshot_mode` is `initial_only`, so not streaming."
+                    );
                     return emitter.close().await;
                 }
                 offset
@@ -803,10 +850,19 @@ async fn run(
                 let repl = settings.conn.connect(true).await?;
                 let created = simple_rows(
                     &repl,
-                    &format!("CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT", quote_ident(&settings.slot_name)),
+                    &format!(
+                        "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+                        quote_ident(&settings.slot_name)
+                    ),
                 )
                 .await
-                .map_err(|error| format!("failed to create replication slot `{}`: {}", settings.slot_name, error_text(&error)))?;
+                .map_err(|error| {
+                    format!(
+                        "failed to create replication slot `{}`: {}",
+                        settings.slot_name,
+                        error_text(&error)
+                    )
+                })?;
                 let lsn: Lsn = created
                     .first()
                     .and_then(|row| row.get(1).cloned().flatten())
@@ -816,7 +872,8 @@ async fn run(
                 offset.snapshot_completed = true;
                 if snapshotting {
                     info!(message = "Created the replication slot; snapshotting tables incrementally while streaming.", offset = %offset, tables = captured.len());
-                    offset.incremental = (!captured.is_empty()).then(|| IncrementalProgress::new(captured.clone()));
+                    offset.incremental =
+                        (!captured.is_empty()).then(|| IncrementalProgress::new(captured.clone()));
                 } else {
                     info!(message = "Created the replication slot; streaming without a snapshot.", offset = %offset);
                     offset.snapshotted_tables = captured.clone();
@@ -836,9 +893,17 @@ async fn run(
         .iter()
         .chain(start.incremental.iter().flat_map(|p| p.tables.iter()))
         .collect();
-    let new_tables: Vec<TableRef> = captured.iter().filter(|t| !queued.contains(t)).cloned().collect();
+    let new_tables: Vec<TableRef> = captured
+        .iter()
+        .filter(|t| !queued.contains(t))
+        .cloned()
+        .collect();
     if !new_tables.is_empty() {
-        let names = new_tables.iter().map(|(s, t)| format!("{s}.{t}")).collect::<Vec<_>>().join(", ");
+        let names = new_tables
+            .iter()
+            .map(|(s, t)| format!("{s}.{t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         if settings.snapshot_new_tables {
             info!(message = "Snapshotting captured tables that were never snapshotted, incrementally.", tables = %names);
             start
@@ -857,7 +922,16 @@ async fn run(
         }
     }
 
-    stream::stream(&settings, query, &mut registry, &mut emitter, start, &captured, released_rx, shutdown)
-        .await?;
+    stream::stream(
+        &settings,
+        query,
+        &mut registry,
+        &mut emitter,
+        start,
+        &captured,
+        released_rx,
+        shutdown,
+    )
+    .await?;
     emitter.close().await
 }

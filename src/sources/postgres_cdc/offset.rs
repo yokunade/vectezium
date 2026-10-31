@@ -12,8 +12,8 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value as Json};
 
-pub use crate::sources::cdc::checkpoint::CheckpointStore;
 use crate::sources::cdc::checkpoint::CdcOffset;
+pub use crate::sources::cdc::checkpoint::CheckpointStore;
 
 /// Current on-disk checkpoint format version.
 const CHECKPOINT_VERSION: u32 = 1;

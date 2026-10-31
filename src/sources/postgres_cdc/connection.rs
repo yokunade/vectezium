@@ -56,9 +56,9 @@ impl ConnectionSettings {
         let mut builder = SslConnector::builder(SslMethod::tls())
             .map_err(|error| format!("failed to set up TLS: {error}"))?;
         if let Some(ca) = &config.ssl_ca_file {
-            builder
-                .set_ca_file(ca)
-                .map_err(|error| format!("failed to load `ssl_ca_file` {}: {error}", ca.display()))?;
+            builder.set_ca_file(ca).map_err(|error| {
+                format!("failed to load `ssl_ca_file` {}: {error}", ca.display())
+            })?;
         }
         if config.ssl_mode == SslMode::Require {
             builder.set_verify(SslVerifyMode::NONE);
@@ -85,18 +85,23 @@ impl ConnectionSettings {
             config.replication_mode(ReplicationMode::Logical);
         }
         let connecting = config.connect(self.tls.clone());
-        let (client, connection) = match tokio::time::timeout(self.connect_timeout, connecting).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => {
-                return Err(format!("failed to connect to {}: {}", self.endpoint, error_text(&error)));
-            }
-            Err(_) => {
-                return Err(format!(
-                    "timed out after {:?} connecting to {}",
-                    self.connect_timeout, self.endpoint
-                ));
-            }
-        };
+        let (client, connection) =
+            match tokio::time::timeout(self.connect_timeout, connecting).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(error)) => {
+                    return Err(format!(
+                        "failed to connect to {}: {}",
+                        self.endpoint,
+                        error_text(&error)
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "timed out after {:?} connecting to {}",
+                        self.connect_timeout, self.endpoint
+                    ));
+                }
+            };
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 debug!(message = "PostgreSQL connection ended.", %error);
@@ -121,11 +126,18 @@ pub fn sqlstate(error: &pgrepl_tokio_postgres::Error) -> Option<String> {
 
 /// Runs a statement in the simple-query protocol (the only one replication connections speak)
 /// and returns the text of every row.
-pub async fn simple_rows(client: &Client, sql: &str) -> Result<Vec<Vec<Option<String>>>, pgrepl_tokio_postgres::Error> {
+pub async fn simple_rows(
+    client: &Client,
+    sql: &str,
+) -> Result<Vec<Vec<Option<String>>>, pgrepl_tokio_postgres::Error> {
     let mut rows = Vec::new();
     for message in client.simple_query(sql).await? {
         if let SimpleQueryMessage::Row(row) = message {
-            rows.push((0..row.len()).map(|i| row.get(i).map(str::to_owned)).collect());
+            rows.push(
+                (0..row.len())
+                    .map(|i| row.get(i).map(str::to_owned))
+                    .collect(),
+            );
         }
     }
     Ok(rows)
@@ -134,7 +146,10 @@ pub async fn simple_rows(client: &Client, sql: &str) -> Result<Vec<Vec<Option<St
 /// What the server sent on the replication stream.
 pub enum Received {
     /// A pgoutput message; `wal_end` is the server's WAL position when it was sent.
-    Message { message: LogicalReplicationMessage, wal_end: Lsn },
+    Message {
+        message: LogicalReplicationMessage,
+        wal_end: Lsn,
+    },
     /// A keepalive; `reply` asks for a status update right away.
     KeepAlive { wal_end: Lsn, reply: bool },
 }
@@ -154,7 +169,12 @@ fn pg_now() -> i64 {
 impl Replication {
     /// `START_REPLICATION` on `slot` from `lsn`, streaming `publication` (pgoutput protocol 1,
     /// whole transactions only).
-    pub async fn start(client: Client, slot: &str, lsn: Lsn, publication: &str) -> Result<Self, pgrepl_tokio_postgres::Error> {
+    pub async fn start(
+        client: Client,
+        slot: &str,
+        lsn: Lsn,
+        publication: &str,
+    ) -> Result<Self, pgrepl_tokio_postgres::Error> {
         let query = format!(
             "START_REPLICATION SLOT {} LOGICAL {lsn} (proto_version '1', publication_names '{}')",
             quote_ident_simple(slot),
@@ -192,17 +212,31 @@ impl Replication {
     }
 
     /// Reports what was received (`written`) and what the server may forget (`flushed`).
-    pub async fn status(&mut self, written: Lsn, flushed: Lsn) -> Result<(), pgrepl_tokio_postgres::Error> {
+    pub async fn status(
+        &mut self,
+        written: Lsn,
+        flushed: Lsn,
+    ) -> Result<(), pgrepl_tokio_postgres::Error> {
         let (w, f) = (PgLsn::from(written.0), PgLsn::from(flushed.0));
-        self.stream.as_mut().standby_status_update(w, f, f, pg_now(), 0).await
+        self.stream
+            .as_mut()
+            .standby_status_update(w, f, f, pg_now(), 0)
+            .await
     }
 
     /// A status update that asks the server to answer with a keepalive right away (its current
     /// position), so a source waiting for the stream to reach a point need not wait for the next
     /// regular keepalive when nothing is being written.
-    pub async fn request_keepalive(&mut self, written: Lsn, flushed: Lsn) -> Result<(), pgrepl_tokio_postgres::Error> {
+    pub async fn request_keepalive(
+        &mut self,
+        written: Lsn,
+        flushed: Lsn,
+    ) -> Result<(), pgrepl_tokio_postgres::Error> {
         let (w, f) = (PgLsn::from(written.0), PgLsn::from(flushed.0));
-        self.stream.as_mut().standby_status_update(w, f, f, pg_now(), 1).await
+        self.stream
+            .as_mut()
+            .standby_status_update(w, f, f, pg_now(), 1)
+            .await
     }
 }
 

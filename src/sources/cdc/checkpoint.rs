@@ -177,7 +177,15 @@ impl<O: CdcOffset> Checkpoints<O> {
         guard: WriterGuard,
         written: tokio::sync::oneshot::Sender<()>,
     ) -> Self {
-        Self::start_notifying(acknowledgements, store, poisoned, publisher, guard, written, None)
+        Self::start_notifying(
+            acknowledgements,
+            store,
+            poisoned,
+            publisher,
+            guard,
+            written,
+            None,
+        )
     }
 
     /// Like [`Self::start`], and also reports on `stored` every offset the source may forget
@@ -364,7 +372,9 @@ async fn checkpoint_writer<O: CdcOffset>(
     if let Some(publisher) = publisher.as_mut()
         && let Some(offset) = stored.as_ref()
         && (offset.seq() > published_seq
-            || published.as_ref().is_some_and(|p| offset.advances_without_seq(p)))
+            || published
+                .as_ref()
+                .is_some_and(|p| offset.advances_without_seq(p)))
     {
         publisher.publish(offset).await;
         notify(offset);

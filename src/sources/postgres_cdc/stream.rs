@@ -165,7 +165,15 @@ pub(super) async fn stream(
         state.txn = None;
         // A chunk read for the previous connection is read again (from the stored progress).
         state.window = None;
-        match session(&mut state, &mut replication, emitter, &mut released, &mut shutdown).await? {
+        match session(
+            &mut state,
+            &mut replication,
+            emitter,
+            &mut released,
+            &mut shutdown,
+        )
+        .await?
+        {
             End::Shutdown => return Ok(()),
             End::Disconnected(error) => {
                 emitter.discard_uncommitted();
@@ -335,13 +343,27 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
             state.tables.insert(relation.rel_id(), info);
         }
         M::Insert(insert) => {
-            let touched = row_change(state, emitter, insert.rel_id(), Op::Create, None, Some(insert.tuple()))?;
+            let touched = row_change(
+                state,
+                emitter,
+                insert.rel_id(),
+                Op::Create,
+                None,
+                Some(insert.tuple()),
+            )?;
             drop_touched(state, touched);
         }
         M::Update(update) => {
             let old = update.old_tuple().or(update.key_tuple());
             let full = update.old_tuple().is_some();
-            let touched = row_change_update(state, emitter, update.rel_id(), old, full, update.new_tuple())?;
+            let touched = row_change_update(
+                state,
+                emitter,
+                update.rel_id(),
+                old,
+                full,
+                update.new_tuple(),
+            )?;
             drop_touched(state, touched);
         }
         M::Delete(delete) => {
@@ -359,7 +381,11 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
                 let Some(info) = state.tables.get(rel) else {
                     continue;
                 };
-                if !state.settings.filters.table_included(&info.schema, &info.table) {
+                if !state
+                    .settings
+                    .filters
+                    .table_included(&info.schema, &info.table)
+                {
                     continue;
                 }
                 // A chunk read before this truncate is stale as a whole.
@@ -370,10 +396,14 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
                 {
                     window.drop_all();
                 }
-                let mut payload = control_base(state.settings, "truncate", &info.schema, xid, commit_lsn);
+                let mut payload =
+                    control_base(state.settings, "truncate", &info.schema, xid, commit_lsn);
                 payload.insert("table".into(), Json::from(info.table.as_str()));
                 payload.insert("cascade".into(), Json::from(truncate.options() & 1 != 0));
-                payload.insert("restart_identity".into(), Json::from(truncate.options() & 2 != 0));
+                payload.insert(
+                    "restart_identity".into(),
+                    Json::from(truncate.options() & 2 != 0),
+                );
                 emitter.push_control(
                     payload,
                     EventMeta {
@@ -395,10 +425,19 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
     Ok(())
 }
 
-fn control_base(settings: &Settings, kind: &str, schema: &str, xid: u32, lsn: Lsn) -> Map<String, Json> {
+fn control_base(
+    settings: &Settings,
+    kind: &str,
+    schema: &str,
+    xid: u32,
+    lsn: Lsn,
+) -> Map<String, Json> {
     let mut payload = Map::new();
     payload.insert("type".into(), Json::from(kind));
-    payload.insert("server_name".into(), Json::from(settings.topic_prefix.as_str()));
+    payload.insert(
+        "server_name".into(),
+        Json::from(settings.topic_prefix.as_str()),
+    );
     payload.insert("db".into(), Json::from(schema));
     payload.insert("database".into(), Json::from(settings.database.as_str()));
     payload.insert("txid".into(), Json::from(xid));
@@ -429,11 +468,23 @@ fn schema_change(state: &State<'_>, emitter: &mut Emitter, previous: &TableInfo,
         })
         .map(|c| &c.name)
         .collect();
-    let mut payload = control_base(state.settings, "schema_change", &info.schema, txn.xid, txn.commit_lsn);
+    let mut payload = control_base(
+        state.settings,
+        "schema_change",
+        &info.schema,
+        txn.xid,
+        txn.commit_lsn,
+    );
     payload.insert("table".into(), Json::from(info.table.as_str()));
     payload.insert("kind".into(), Json::from("table"));
-    payload.insert("previous_schema_version".into(), Json::from(previous.schema_version.as_str()));
-    payload.insert("schema_version".into(), Json::from(info.schema_version.as_str()));
+    payload.insert(
+        "previous_schema_version".into(),
+        Json::from(previous.schema_version.as_str()),
+    );
+    payload.insert(
+        "schema_version".into(),
+        Json::from(info.schema_version.as_str()),
+    );
     payload.insert("columns_added".into(), serde_json::json!(added));
     payload.insert("columns_removed".into(), serde_json::json!(removed));
     payload.insert("columns_retyped".into(), serde_json::json!(retyped));
@@ -494,7 +545,10 @@ fn tuple_row(
             continue;
         }
         let unchanged = matches!(tuple.tuple_data().get(i), Some(TupleData::UnchangedToast))
-            && !matches!(old.and_then(|o| o.tuple_data().get(i)), Some(TupleData::Text(_) | TupleData::Null));
+            && !matches!(
+                old.and_then(|o| o.tuple_data().get(i)),
+                Some(TupleData::Text(_) | TupleData::Null)
+            );
         let value = if unchanged {
             Json::from(settings.placeholder.as_str())
         } else {
@@ -514,11 +568,14 @@ fn target<'s>(state: &'s State<'_>, rel: u32) -> Result<Option<(&'s Txn, &'s Tab
     if txn.skip {
         return Ok(None);
     }
-    let info = state
-        .tables
-        .get(&rel)
-        .ok_or_else(|| format!("a change arrived for relation {rel} before its Relation message"))?;
-    if !state.settings.filters.table_included(&info.schema, &info.table) {
+    let info = state.tables.get(&rel).ok_or_else(|| {
+        format!("a change arrived for relation {rel} before its Relation message")
+    })?;
+    if !state
+        .settings
+        .filters
+        .table_included(&info.schema, &info.table)
+    {
         return Ok(None);
     }
     Ok(Some((txn, info)))
@@ -544,7 +601,13 @@ fn push(
         xid: txn.xid,
         keys,
     };
-    note_table_schema(emitter, state.settings, info, "stream", Some(txn.commit_lsn));
+    note_table_schema(
+        emitter,
+        state.settings,
+        info,
+        "stream",
+        Some(txn.commit_lsn),
+    );
     let source = state.settings.source_info(
         info,
         txn.ts_us,
@@ -553,7 +616,15 @@ fn push(
         Some(txn.commit_lsn),
         state.last_commit_lsn,
     );
-    let event = row_event(&emitter.builder(), info, op, before, after, &source, timestamp(txn.ts_us));
+    let event = row_event(
+        &emitter.builder(),
+        info,
+        op,
+        before,
+        after,
+        &source,
+        timestamp(txn.ts_us),
+    );
     emitter.push_prebuilt(event);
     touched
 }
@@ -570,13 +641,20 @@ fn row_change(
         return Ok(None);
     };
     let converted = (|| {
-        let before = before.map(|t| tuple_row(state.settings, info, t, None, false)).transpose()?;
-        let after = after.map(|t| tuple_row(state.settings, info, t, None, false)).transpose()?;
+        let before = before
+            .map(|t| tuple_row(state.settings, info, t, None, false))
+            .transpose()?;
+        let after = after
+            .map(|t| tuple_row(state.settings, info, t, None, false))
+            .transpose()?;
         Ok::<_, String>((before, after))
     })();
     match converted {
         Ok((before, after)) => Ok(Some(push(state, emitter, txn, info, op, before, after))),
-        Err(error) => state.settings.handle_failure(error, &info.schema, &info.table).map(|()| None),
+        Err(error) => state
+            .settings
+            .handle_failure(error, &info.schema, &info.table)
+            .map(|()| None),
     }
 }
 
@@ -592,13 +670,26 @@ fn row_change_update(
         return Ok(None);
     };
     let converted = (|| {
-        let before = old.map(|t| tuple_row(state.settings, info, t, None, !full)).transpose()?;
+        let before = old
+            .map(|t| tuple_row(state.settings, info, t, None, !full))
+            .transpose()?;
         let after = tuple_row(state.settings, info, new, old.filter(|_| full), false)?;
         Ok::<_, String>((before, after))
     })();
     match converted {
-        Ok((before, after)) => Ok(Some(push(state, emitter, txn, info, Op::Update, before, Some(after)))),
-        Err(error) => state.settings.handle_failure(error, &info.schema, &info.table).map(|()| None),
+        Ok((before, after)) => Ok(Some(push(
+            state,
+            emitter,
+            txn,
+            info,
+            Op::Update,
+            before,
+            Some(after),
+        ))),
+        Err(error) => state
+            .settings
+            .handle_failure(error, &info.schema, &info.table)
+            .map(|()| None),
     }
 }
 
@@ -624,8 +715,19 @@ fn row_change_delete(
             .map(|()| None);
     };
     match tuple_row(state.settings, info, old, None, !full) {
-        Ok(before) => Ok(Some(push(state, emitter, txn, info, Op::Delete, Some(before), None))),
-        Err(error) => state.settings.handle_failure(error, &info.schema, &info.table).map(|()| None),
+        Ok(before) => Ok(Some(push(
+            state,
+            emitter,
+            txn,
+            info,
+            Op::Delete,
+            Some(before),
+            None,
+        ))),
+        Err(error) => state
+            .settings
+            .handle_failure(error, &info.schema, &info.table)
+            .map(|()| None),
     }
 }
 
@@ -645,7 +747,10 @@ fn drop_touched(state: &mut State<'_>, touched: Option<Touched>) {
 /// Reads the next chunk of the incremental snapshot when none is open and no transaction is
 /// being read, and asks the server for its position so the window can close soon even when
 /// nothing is written. Returns `Some` if the connection broke.
-async fn open_window(state: &mut State<'_>, replication: &mut Replication) -> Result<Option<End>, String> {
+async fn open_window(
+    state: &mut State<'_>,
+    replication: &mut Replication,
+) -> Result<Option<End>, String> {
     if state.window.is_some() || state.txn.is_some() {
         return Ok(None);
     }
@@ -693,8 +798,14 @@ async fn open_window(state: &mut State<'_>, replication: &mut Replication) -> Re
             progress.started_seq = None;
         }
     }
-    if let Err(error) = replication.request_keepalive(state.received, state.released).await {
-        return Ok(Some(End::Disconnected(format!("failed to send a status update: {}", error_text(&error)))));
+    if let Err(error) = replication
+        .request_keepalive(state.received, state.released)
+        .await
+    {
+        return Ok(Some(End::Disconnected(format!(
+            "failed to send a status update: {}",
+            error_text(&error)
+        ))));
     }
     Ok(None)
 }
@@ -712,7 +823,12 @@ fn close_window(state: &mut State<'_>, emitter: &mut Emitter, position: Lsn) {
     let started_seq = *progress.started_seq.get_or_insert(emitter.next_seq());
     let snapshot_id = progress.snapshot_id.clone();
     let started_ms = progress.started_ms;
-    let (table, info, high, complete) = (window.table.clone(), window.info.clone(), window.high, window.complete);
+    let (table, info, high, complete) = (
+        window.table.clone(),
+        window.info.clone(),
+        window.high,
+        window.complete,
+    );
     progress.last_key = window.last_key.clone();
 
     note_table_schema(emitter, state.settings, &info, "snapshot", Some(high));
@@ -720,7 +836,14 @@ fn close_window(state: &mut State<'_>, emitter: &mut Emitter, position: Lsn) {
     let now = Utc::now();
     let mut emitted = 0;
     for after in window.into_rows() {
-        let source = state.settings.source_info(&info, now.timestamp_micros(), SnapshotMarker::Incremental, None, Some(high), None);
+        let source = state.settings.source_info(
+            &info,
+            now.timestamp_micros(),
+            SnapshotMarker::Incremental,
+            None,
+            Some(high),
+            None,
+        );
         let mut event = row_event(&builder, &info, Op::Read, None, Some(after), &source, now);
         builder.set_snapshot_id(&mut event, &snapshot_id);
         emitter.push_snapshot_row(event);
@@ -761,7 +884,12 @@ fn close_window(state: &mut State<'_>, emitter: &mut Emitter, position: Lsn) {
         if !state.offset.snapshotted_tables.contains(&table) {
             state.offset.snapshotted_tables.push(table);
         }
-        if state.offset.incremental.as_ref().is_some_and(|p| p.tables.is_empty()) {
+        if state
+            .offset
+            .incremental
+            .as_ref()
+            .is_some_and(|p| p.tables.is_empty())
+        {
             state.offset.incremental = None;
             info!(message = "Incremental snapshot complete.");
         }
