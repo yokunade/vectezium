@@ -214,6 +214,10 @@ impl CdcOffset for Offset {
         payload.insert("file".into(), Json::from(self.file.as_str()));
         payload.insert("pos".into(), Json::from(self.pos));
     }
+
+    fn advances_without_seq(&self, published: &Self) -> bool {
+        self.last_signal != published.last_signal
+    }
 }
 
 impl fmt::Display for Offset {

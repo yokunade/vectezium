@@ -193,7 +193,7 @@ impl CdcOffset for Offset {
     }
 
     fn advances_without_seq(&self, published: &Self) -> bool {
-        self.lsn > published.lsn
+        self.lsn > published.lsn || self.last_signal != published.last_signal
     }
 }
 
