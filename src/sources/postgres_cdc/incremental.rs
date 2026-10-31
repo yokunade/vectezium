@@ -132,6 +132,8 @@ pub enum Chunk {
     Gone,
     /// The table has no key to read it in order by.
     NoKey,
+    /// The stored position is not a key of the table (it changed, or the offset was altered).
+    BadPosition,
 }
 
 /// Reads the next chunk of `table` after `last_key`.
@@ -176,10 +178,23 @@ pub async fn read_chunk(
         .map(|&i| quote_ident(&info.columns[i].name))
         .collect::<Vec<_>>()
         .join(", ");
-    // Untyped literals take the key columns' types in the row comparison.
-    let after = last_key.map_or(String::new(), |values| {
-        format!(" WHERE ({key_columns}) > ({})", values.join(", "))
-    });
+    // The position comes from the stored or recovered offset: parse it and quote it again, never
+    // splice it in as it is. Untyped literals take the key columns' types in the row comparison.
+    let after = match last_key {
+        None => String::new(),
+        Some(values) => {
+            let literals = values
+                .iter()
+                .map(|value| parse_text_literal(value).map(|text| quote_literal(&text)))
+                .collect::<Option<Vec<_>>>();
+            match literals {
+                Some(literals) if literals.len() == info.key.len() => {
+                    format!(" WHERE ({key_columns}) > ({})", literals.join(", "))
+                }
+                _ => return Ok(Chunk::BadPosition),
+            }
+        }
+    };
     let select = format!(
         "SELECT {columns} FROM {qualified}{after} ORDER BY {key_columns} LIMIT {chunk_size}"
     );
@@ -261,9 +276,42 @@ pub async fn read_chunk(
     })))
 }
 
+/// Parses a stored chunk position: a key value's text in single quotes, with quotes doubled (as
+/// `read_chunk` writes it). Anything else is `None`.
+fn parse_text_literal(literal: &str) -> Option<String> {
+    let inner = literal.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' && chars.next()? != '\'' {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// Quotes `text` as an escape string constant (`E'…'`), which reads the same whatever
+/// `standard_conforming_strings` is set to.
+fn quote_literal(text: &str) -> String {
+    format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_positions_are_requoted() {
+        for text in ["42", "it's", "back\\slash", "ünïcödé", "", "x') OR (1=1"] {
+            let stored = format!("'{}'", text.replace('\'', "''"));
+            assert_eq!(parse_text_literal(&stored).as_deref(), Some(text));
+        }
+        assert_eq!(quote_literal("a'b\\c"), "E'a''b\\\\c'");
+        for stored in ["42", "'a'b'", "'unterminated", "'a') OR (1=1", "E'a'", ""] {
+            assert_eq!(parse_text_literal(stored), None, "{stored}");
+        }
+    }
 
     #[test]
     fn parses_snapshots() {
