@@ -321,8 +321,8 @@ treated as snapshotted.
 ### Unplanned snapshots (`unplanned_snapshots`)
 
 Planned snapshots always run: the first start, tables added to the include lists
-(`snapshot_new_tables`), and tables an operator queues by removing them from
-`snapshotted_tables` in the offset file while the source is stopped. Two other situations would
+(`snapshot_new_tables`), and tables an operator queues (an `execute-snapshot` signal, or removing
+them from `snapshotted_tables` in the offset file while the source is stopped). Two other situations would
 snapshot tables nobody asked for; with `unplanned_snapshots: hold` (the default) they wait for an
 operator instead:
 
@@ -331,9 +331,60 @@ operator instead:
 | The binlog was purged past the stored offset (`snapshot_mode: when_needed`): every table must be read again | The source refuses to start until `"resnapshot_approved": true` is set in the offset file (it is used once) | Re-snapshot every table |
 | An offset was recovered without its table-snapshot state (see *Offset recovery*) | The tables are streamed but not snapshotted: listed in `held_tables` of the offset, logged, and announced with a `snapshot_held` control event at every start | Snapshot them as new tables |
 
-To release a held table, stop the source and either remove it from `held_tables` (it is then
-snapshotted as a new table) or move it to `snapshotted_tables` (it is treated as complete). With
-`allow`, held tables are released on the next start.
+To release a held table, send an `execute-snapshot` signal for it (it is snapshotted) or a
+`dismiss-held` signal (it is treated as complete); see *Signals*. Without `signals`, stop the
+source and either remove it from `held_tables` (it is then snapshotted as a new table) or move it
+to `snapshotted_tables`. With `allow`, held tables are released on the next start.
+
+With `signals` configured, a source that needs approval for a full re-snapshot waits for an
+`approve-resnapshot` signal instead of refusing to start (it holds the lock meanwhile, and
+writes `waiting.json` in the signal folder).
+
+### Signals (`signals`)
+
+Operator requests a running source takes from files, without a restart: Debezium's file signal
+channel, one file per signal. `postgres_cdc` takes the same signals.
+
+```yaml
+signals:
+  folder: /var/lib/vectezium/signals/mysql   # pending/ and processed/ are created in it
+  poll_interval_secs: 2
+```
+
+Write a file to `<folder>/pending/` (write it under a name starting with `.` or ending in
+`.tmp`, then rename it, so it is never read half-written). Files are applied in name order, so
+start names with a timestamp:
+
+```json
+{"id": "8f0c…", "type": "execute-snapshot",
+ "data": {"data-collections": ["shop.orders", "shop.customers"], "type": "incremental"}}
+```
+
+| `type` | `data` | Effect |
+|---|---|---|
+| `execute-snapshot` | `data-collections`; `type` (optional) must be `incremental` | Queue the tables for an incremental snapshot (after any already queued). Releases them if held. Needs GTID mode. |
+| `stop-snapshot` | `data-collections` (optional) | Drop the tables (without `data-collections`: every table) from the queue. Rows already emitted stay; the table gets no `snapshot_completed`. |
+| `dismiss-held` | `data-collections` | Treat held tables as snapshotted, without reading them (Vectezium only). |
+| `approve-resnapshot` | — | Approve the full re-snapshot the source is waiting for at start-up (Vectezium only). |
+
+`data` may also be a JSON string, as in Debezium's signal table. Tables must be captured (by the
+include and exclude lists). To capture a new table, add it to the include list and redeploy:
+with `snapshot_new_tables: true` it is snapshotted on start.
+
+Within `poll_interval_secs` the source applies each signal between transactions, commits an
+offset recording it (`last_signal`), and moves the file to `<folder>/processed/` with its
+result added:
+
+```json
+"result": {"status": "applied", "message": "queued shop.orders", "ts_ms": 1767225600000}
+```
+
+A rejected signal (unknown type, a table that is not captured, invalid JSON) is moved there too,
+with `"status": "rejected"` and the reason; every signal is also logged. The newest 200 processed
+files are kept. If the source stops before the offset recording a signal is stored, it applies
+the signals in `processed/` after its stored `last_signal` again at the next start; applying a
+signal twice does the same as applying it once. (An approval is not applied again: it is only
+good for the start it was given to.)
 
 ## Schema changes and other statements
 
@@ -527,8 +578,8 @@ checkpoint write errors and delivery failures increment `component_errors_total`
 ## Not supported (yet)
 
 * MariaDB (different GTID format and binlog events).
-* Ad-hoc snapshots on request (Debezium signals); a table can be re-snapshotted by removing it
-  from `snapshotted_tables` in the offset file while stopped, with `snapshot_new_tables: true`.
+* Debezium's signal table and Kafka signal channels (signals are read from files: see
+  *Signals*), and blocking ad-hoc snapshots (`execute-snapshot` with `type: blocking`).
 * Two-phase XA transactions (`XA PREPARE`, then `XA COMMIT` or `XA ROLLBACK`): whether their
   changes commit is only known later, in a separate binlog group. One that changes a captured
   table stops the source; with `event_processing_failure_handling_mode: warn` or `skip` its

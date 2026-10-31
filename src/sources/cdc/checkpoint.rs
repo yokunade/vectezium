@@ -62,9 +62,10 @@ pub trait CdcOffset:
     fn publish_position(&self, payload: &mut Map<String, Json>);
 
     /// Whether this offset should be published although its `seq` equals that of `published`:
-    /// its log position moved on while no captured changes flowed. A connector whose server
-    /// keeps log until offsets are published (a PostgreSQL slot with `publish_offsets`) needs
-    /// this so an idle source keeps releasing log.
+    /// its log position moved on while no captured changes flowed (a connector whose server
+    /// keeps log until offsets are published, such as a PostgreSQL slot with `publish_offsets`,
+    /// needs this so an idle source keeps releasing log), or a signal changed its snapshot state
+    /// (so the published offset shows a held table released or a snapshot stopped).
     fn advances_without_seq(&self, _published: &Self) -> bool {
         false
     }

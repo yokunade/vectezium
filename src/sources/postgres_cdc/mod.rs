@@ -50,7 +50,7 @@ use crate::sources::cdc::filter;
 pub use crate::sources::cdc::{
     CONTROL_OUTPUT, EventFormat, EventProcessingFailureHandlingMode, OBSERVE_OUTPUT,
     OFFSETS_OUTPUT, RecordImages, TABLE_SCHEMAS_OUTPUT, lock::SingleWriterLockConfig,
-    recovery::OffsetRecoveryConfig,
+    recovery::OffsetRecoveryConfig, signal::SignalsConfig,
 };
 
 /// How the source bootstraps when it starts.
@@ -425,6 +425,13 @@ pub struct PostgresCdcConfig {
     /// Needs `single_writer_lock` and `publish_offsets`.
     #[serde(default)]
     pub offset_recovery: Option<OffsetRecoveryConfig>,
+
+    /// Take operator requests from files in a folder while running (Debezium's file signal
+    /// channel): ad-hoc incremental snapshots (`execute-snapshot`, `stop-snapshot`) and approving
+    /// a full re-snapshot (see `mysql_cdc`). Without it, those need the offset file edited while
+    /// the source is stopped.
+    #[serde(default)]
+    pub signals: Option<SignalsConfig>,
 
     /// The maximum number of change events sent downstream in one batch.
     #[serde(default = "default_batch_size")]

@@ -94,6 +94,9 @@ pub struct Offset {
     /// tools can queue tables).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental: Option<IncrementalProgress>,
+    /// The last signal applied (its file name, see `signals`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_signal: Option<String>,
 }
 
 /// An incremental snapshot: tables read in key order, in chunks, while changes stream.
@@ -150,6 +153,7 @@ impl Offset {
             seq_sub: 0,
             resnapshot_approved: false,
             incremental: None,
+            last_signal: None,
         }
     }
 
@@ -189,7 +193,7 @@ impl CdcOffset for Offset {
     }
 
     fn advances_without_seq(&self, published: &Self) -> bool {
-        self.lsn > published.lsn
+        self.lsn > published.lsn || self.last_signal != published.last_signal
     }
 }
 

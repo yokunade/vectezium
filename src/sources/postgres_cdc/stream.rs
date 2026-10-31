@@ -28,14 +28,18 @@ use super::{
     convert,
     envelope::{Op, SnapshotMarker},
     incremental::{self, Chunk, Window, key_text},
-    offset::{Lsn, Offset, TableRef},
+    offset::{IncrementalProgress, Lsn, Offset, TableRef},
     source::{
         Emitter, EventMeta, Settings, connect_retrying, note_table_schema, row_event, row_key,
     },
 };
 use crate::{
-    internal_events::PostgresCdcConnectionError, shutdown::ShutdownSignal,
-    sources::cdc::control::snapshot_completed,
+    internal_events::PostgresCdcConnectionError,
+    shutdown::ShutdownSignal,
+    sources::cdc::{
+        control::snapshot_completed,
+        signal::{self, SnapshotQueue, Spool},
+    },
 };
 
 /// Microseconds between the Unix epoch and PostgreSQL's (2000-01-01).
@@ -97,6 +101,11 @@ pub(super) async fn stream(
     mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
     info!(message = "Streaming changes from the replication slot.", offset = %start);
+    let mut spool = settings
+        .signals
+        .as_ref()
+        .map(|config| Spool::open(config, start.last_signal.as_deref()))
+        .transpose()?;
     let known = known_tables(settings, &query, registry, captured).await?;
     let mut state = State {
         settings,
@@ -160,6 +169,7 @@ pub(super) async fn stream(
             &mut replication,
             emitter,
             &mut released,
+            spool.as_mut(),
             &mut shutdown,
         )
         .await
@@ -234,6 +244,7 @@ async fn session(
     replication: &mut Replication,
     emitter: &mut Emitter,
     released: &mut watch::Receiver<Option<Offset>>,
+    mut spool: Option<&mut Spool>,
     shutdown: &mut ShutdownSignal,
 ) -> Result<End, String> {
     let interval = state.settings.status_interval;
@@ -268,6 +279,13 @@ async fn session(
                 }
             }
             _ = flush.tick() => {
+                if let Some(spool) = spool.as_deref_mut()
+                    && state.txn.is_none()
+                    && apply_signals(state, spool, emitter).await?
+                    && let Some(end) = open_window(state, replication).await?
+                {
+                    return Ok(end);
+                }
                 emitter.maybe_flush().await?;
                 emitter.check_health()?;
             }
@@ -310,6 +328,81 @@ async fn session(
             }
         }
     }
+}
+
+/// Applies the signals that are due (between transactions), commits an offset recording them,
+/// and moves them to `processed/`. Returns whether any were applied.
+async fn apply_signals(
+    state: &mut State<'_>,
+    spool: &mut Spool,
+    emitter: &mut Emitter,
+) -> Result<bool, String> {
+    let done = signal::apply_due(spool, state);
+    if done.is_empty() {
+        return Ok(false);
+    }
+    state.offset.last_signal = signal::last_signal(&done);
+    emitter.commit(state.offset.clone());
+    emitter.flush().await?;
+    for (received, outcome) in &done {
+        spool.finish(received, outcome);
+    }
+    Ok(true)
+}
+
+impl SnapshotQueue for State<'_> {
+    fn captured(&self, (schema, table): &TableRef) -> bool {
+        self.settings.filters.table_included(schema, table)
+    }
+
+    fn queued(&self, table: &TableRef) -> bool {
+        self.offset
+            .incremental
+            .as_ref()
+            .is_some_and(|p| p.tables.contains(table))
+    }
+
+    fn queue(&mut self, tables: Vec<TableRef>) {
+        let progress = self
+            .offset
+            .incremental
+            .get_or_insert_with(|| IncrementalProgress::new(Vec::new()));
+        for table in tables {
+            if !progress.tables.contains(&table) {
+                progress.tables.push(table);
+            }
+        }
+    }
+
+    fn stop(&mut self, tables: Option<&[TableRef]>) -> Vec<TableRef> {
+        let Some(progress) = self.offset.incremental.as_mut() else {
+            return Vec::new();
+        };
+        let first = progress.tables.first().cloned();
+        let (stopped, kept): (Vec<TableRef>, Vec<TableRef>) = progress
+            .tables
+            .drain(..)
+            .partition(|t| tables.is_none_or(|stop| stop.contains(t)));
+        progress.tables = kept;
+        if progress.tables.first() != first.as_ref() {
+            // The table being read was stopped: the next one starts from its beginning.
+            progress.last_key = None;
+            progress.rows = 0;
+            progress.started_seq = None;
+            self.window = None;
+        }
+        if progress.tables.is_empty() {
+            self.offset.incremental = None;
+        }
+        stopped
+    }
+
+    // PostgreSQL snapshots are never held: a lost slot stops the source until approved.
+    fn held(&self, _table: &TableRef) -> bool {
+        false
+    }
+
+    fn dismiss(&mut self, _tables: &[TableRef]) {}
 }
 
 const fn ts_us(pg_micros: i64) -> i64 {

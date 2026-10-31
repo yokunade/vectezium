@@ -43,7 +43,7 @@ use crate::sources::cdc::filter;
 pub use crate::sources::cdc::{
     CONTROL_OUTPUT, EventFormat, EventProcessingFailureHandlingMode, OBSERVE_OUTPUT,
     OFFSETS_OUTPUT, RecordImages, TABLE_SCHEMAS_OUTPUT, lock::SingleWriterLockConfig,
-    recovery::OffsetRecoveryConfig,
+    recovery::OffsetRecoveryConfig, signal::SignalsConfig,
 };
 
 /// How the source bootstraps when it starts.
@@ -408,6 +408,13 @@ pub struct MysqlCdcConfig {
     /// `publish_offsets`.
     #[serde(default)]
     pub offset_recovery: Option<OffsetRecoveryConfig>,
+
+    /// Take operator requests from files in a folder while running (Debezium's file signal
+    /// channel): ad-hoc incremental snapshots (`execute-snapshot`, `stop-snapshot`), releasing
+    /// or dismissing held snapshots, and approving a full re-snapshot. Without it, those need
+    /// the offset file edited while the source is stopped.
+    #[serde(default)]
+    pub signals: Option<SignalsConfig>,
 
     /// Populate `source.query` with the SQL statement that caused each row change.
     ///

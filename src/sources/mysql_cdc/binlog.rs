@@ -27,7 +27,11 @@ use super::{
     },
     table_schema::Observed,
 };
-use crate::{internal_events::MysqlCdcConnectionError, shutdown::ShutdownSignal};
+use crate::{
+    internal_events::MysqlCdcConnectionError,
+    shutdown::ShutdownSignal,
+    sources::cdc::signal::{self, SnapshotQueue, Spool},
+};
 
 /// How long the stream may be quiet before pending events are flushed.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -52,6 +56,8 @@ pub(super) struct StreamPosition {
     pub incremental: Option<IncrementalProgress>,
     /// Tables whose (unplanned) snapshot is held: streamed, not snapshotted.
     pub held_tables: Vec<TableRef>,
+    /// The last signal applied.
+    pub last_signal: Option<String>,
 }
 
 enum StreamError {
@@ -85,12 +91,25 @@ pub(super) async fn stream(
     position: StreamPosition,
     mut shutdown: ShutdownSignal,
 ) -> Result<(), String> {
+    let mut spool = settings
+        .signals
+        .as_ref()
+        .map(|config| Spool::open(config, position.last_signal.as_deref()))
+        .transpose()?;
     let mut handler = Handler::new(settings, server, position);
     let mut backoff = MIN_BACKOFF;
 
     loop {
         let started = tokio::time::Instant::now();
-        match run_connection(settings, emitter, &mut handler, &mut shutdown).await {
+        match run_connection(
+            settings,
+            emitter,
+            &mut handler,
+            spool.as_mut(),
+            &mut shutdown,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(StreamError::Fatal(error)) => return Err(error),
             Err(StreamError::Retry(error)) => {
@@ -120,6 +139,7 @@ async fn run_connection(
     settings: &Settings,
     emitter: &mut Emitter,
     handler: &mut Handler<'_>,
+    mut spool: Option<&mut Spool>,
     shutdown: &mut ShutdownSignal,
 ) -> Result<(), StreamError> {
     let mut conn = connect(settings).await.map_err(StreamError::Retry)?;
@@ -204,6 +224,20 @@ async fn run_connection(
             }
         }
 
+        if let Some(spool) = spool.as_deref_mut()
+            && handler.between_transactions()
+        {
+            let done = signal::apply_due(spool, handler);
+            if !done.is_empty() {
+                handler.last_signal = signal::last_signal(&done);
+                handler.commit_progress(emitter);
+                emitter.flush().await.map_err(StreamError::Fatal)?;
+                for (received, outcome) in &done {
+                    spool.finish(received, outcome);
+                }
+            }
+        }
+
         // An open XA transaction's rows may still be dropped at its `XA_prepare` event, so they
         // are held back until then rather than flushed part-way.
         if handler.tx.xa.is_none() {
@@ -249,6 +283,8 @@ struct Handler<'a> {
     incremental: Incremental,
     /// Tables whose snapshot is held; kept in every offset until an operator releases them.
     held: Vec<TableRef>,
+    /// The last signal applied; kept in every offset.
+    last_signal: Option<String>,
 }
 
 impl<'a> Handler<'a> {
@@ -260,6 +296,7 @@ impl<'a> Handler<'a> {
         Self {
             incremental,
             held: std::mem::take(&mut position.held_tables),
+            last_signal: position.last_signal.take(),
             settings,
             server_uuid: server.server_uuid.clone(),
             file: position.file.clone(),
@@ -912,6 +949,7 @@ impl<'a> Handler<'a> {
             self.incremental.progress(),
         )
         .with_held(self.held.clone())
+        .with_last_signal(self.last_signal.clone())
     }
 
     /// Records incremental-snapshot progress at the current (committed) position.
@@ -922,6 +960,40 @@ impl<'a> Handler<'a> {
     /// Not inside a transaction (incremental snapshot chunks are only emitted here).
     const fn between_transactions(&self) -> bool {
         !self.tx.in_tx && self.tx.gtid.is_none()
+    }
+}
+
+impl SnapshotQueue for Handler<'_> {
+    fn captured(&self, (db, table): &TableRef) -> bool {
+        self.settings.filters.table_included(db, table)
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        (!self.position.use_gtid).then(|| "incremental snapshots need GTID mode".to_owned())
+    }
+
+    fn queued(&self, table: &TableRef) -> bool {
+        self.incremental.is_queued(table)
+    }
+
+    fn queue(&mut self, tables: Vec<TableRef>) {
+        self.held.retain(|held| !tables.contains(held));
+        self.incremental.queue(tables);
+    }
+
+    fn stop(&mut self, tables: Option<&[TableRef]>) -> Vec<TableRef> {
+        self.incremental.stop(tables)
+    }
+
+    fn held(&self, table: &TableRef) -> bool {
+        self.held.contains(table)
+    }
+
+    fn dismiss(&mut self, tables: &[TableRef]) {
+        self.held.retain(|held| !tables.contains(held));
+        for table in tables {
+            self.incremental.mark_snapshotted(table.clone());
+        }
     }
 }
 
