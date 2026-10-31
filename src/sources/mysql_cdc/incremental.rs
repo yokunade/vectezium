@@ -154,6 +154,39 @@ impl Incremental {
         }
     }
 
+    /// Whether the table is queued (the first one is being snapshotted).
+    pub fn is_queued(&self, table: &TableRef) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|p| p.tables.contains(table))
+    }
+
+    /// Drops tables (`None`: all) from the queue; returns the ones that were queued. The rows
+    /// of a table already emitted stay emitted, and it gets no `snapshot_completed` event.
+    pub fn stop(&mut self, tables: Option<&[TableRef]>) -> Vec<TableRef> {
+        let Some(progress) = self.progress.as_mut() else {
+            return Vec::new();
+        };
+        let first = progress.tables.first().cloned();
+        let (stopped, kept): (Vec<TableRef>, Vec<TableRef>) = progress
+            .tables
+            .drain(..)
+            .partition(|t| tables.is_none_or(|stop| stop.contains(t)));
+        progress.tables = kept;
+        if progress.tables.first() != first.as_ref() {
+            // The table being read was stopped: the next one starts from its beginning.
+            progress.last_key = None;
+            progress.rows = 0;
+            progress.started_seq = None;
+            self.pending = None;
+        }
+        if progress.tables.is_empty() {
+            self.progress = None;
+            self.conn = None;
+        }
+        stopped
+    }
+
     /// Forgets the chunk being held (after a reconnect it is read again).
     pub fn reset_pending(&mut self) {
         self.pending = None;
@@ -630,6 +663,36 @@ fn unescape_quoted(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn t(table: &str) -> TableRef {
+        ("shop".into(), table.into())
+    }
+
+    #[test]
+    fn stopping_the_table_being_read_resets_the_position() {
+        let mut incremental = Incremental::new(Vec::new(), None);
+        incremental.queue(vec![t("a"), t("b"), t("c")]);
+        let progress = incremental.progress.as_mut().unwrap();
+        progress.last_key = Some(vec!["5".into()]);
+        progress.rows = 5;
+
+        // A queued table: the one being read keeps its position.
+        assert_eq!(incremental.stop(Some(&[t("b")])), vec![t("b")]);
+        assert_eq!(incremental.progress().unwrap().rows, 5);
+        assert!(!incremental.is_queued(&t("b")));
+
+        // The one being read: the next starts from its beginning.
+        assert_eq!(incremental.stop(Some(&[t("a")])), vec![t("a")]);
+        let progress = incremental.progress().unwrap();
+        assert_eq!(progress.tables, vec![t("c")]);
+        assert_eq!(progress.last_key, None);
+        assert_eq!(progress.rows, 0);
+
+        assert_eq!(incremental.stop(Some(&[t("x")])), Vec::<TableRef>::new());
+        assert_eq!(incremental.stop(None), vec![t("c")]);
+        assert!(incremental.progress().is_none());
+        assert!(!incremental.has_work());
+    }
 
     #[test]
     fn key_literals_round_trip() {

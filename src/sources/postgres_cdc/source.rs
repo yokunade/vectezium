@@ -37,6 +37,7 @@ use crate::{
             checkpoint::{Checkpoints, OffsetPublisher, check_acknowledgements},
             lock::{WriterGuard, run_locked},
             recovery::{OffsetRecovery, Recovered},
+            signal::{self, SignalsConfig},
         },
         source_with_error,
     },
@@ -83,6 +84,7 @@ pub(super) struct Settings {
     pub record_images: RecordImages,
     pub publish_offsets: Option<Duration>,
     pub status_interval: Duration,
+    pub signals: Option<SignalsConfig>,
     /// Tables already reported as having no key.
     pub warned_no_key: Mutex<HashSet<String>>,
 }
@@ -330,6 +332,7 @@ pub(super) fn build(config: &PostgresCdcConfig, cx: SourceContext) -> crate::Res
             .publish_offsets
             .then(|| Duration::from_secs(config.offset_publish_interval_secs.max(1))),
         status_interval: Duration::from_secs(config.status_update_interval_secs.max(1)),
+        signals: config.signals.clone(),
         warned_no_key: Mutex::default(),
     };
 
@@ -805,13 +808,21 @@ async fn run(
                 if settings.unplanned_snapshots == UnplannedSnapshots::Hold
                     && !offset.resnapshot_approved
                 {
-                    return Err(format!(
+                    let reason = format!(
                         "replication slot `{}` {why}, so every captured table would be \
-                         snapshotted again. `unplanned_snapshots` is `hold`: approve the \
-                         re-snapshot by setting `\"resnapshot_approved\": true` in {offset_file} \
-                         while the source is stopped, or set `unplanned_snapshots: allow`",
+                         snapshotted again",
                         settings.slot_name
-                    ));
+                    );
+                    let Some(signals) = &settings.signals else {
+                        return Err(format!(
+                            "{reason}. `unplanned_snapshots` is `hold`: approve the re-snapshot \
+                             by setting `\"resnapshot_approved\": true` in {offset_file} while \
+                             the source is stopped, or set `unplanned_snapshots: allow`"
+                        ));
+                    };
+                    if !signal::await_approval(signals, &reason, &mut shutdown).await? {
+                        return emitter.close().await;
+                    }
                 }
                 warn!(message = "The replication slot was lost; re-snapshotting.", slot = %settings.slot_name, %why);
                 None

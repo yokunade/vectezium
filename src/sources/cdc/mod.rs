@@ -14,6 +14,7 @@
 //! | [`lock`] | The single-writer lock (an Azure blob lease) and [`run_locked`](lock::run_locked) |
 //! | [`recovery`] | Resuming from the published offset when the stored one is lost (`offset_recovery`) |
 //! | [`seq`] | The master sequence format |
+//! | [`signal`] | Operator requests (ad-hoc snapshots, held snapshots, approvals) taken from a folder while running |
 //!
 //! # Adding a connector
 //!
@@ -45,6 +46,7 @@ pub mod filter;
 pub mod lock;
 pub mod recovery;
 pub mod seq;
+pub mod signal;
 
 use vector_lib::{config::LogNamespace, configurable::configurable_component, schema::Definition};
 

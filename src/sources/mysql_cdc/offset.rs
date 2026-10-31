@@ -71,6 +71,10 @@ pub struct Offset {
     /// (`unplanned_snapshots: hold`). Used once: offsets written afterwards do not carry it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resnapshot_approved: bool,
+
+    /// The last signal applied (its file name, see `signals`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_signal: Option<String>,
 }
 
 /// `(database, table)`.
@@ -122,6 +126,7 @@ impl Offset {
             incremental: None,
             held_tables: Vec::new(),
             resnapshot_approved: false,
+            last_signal: None,
         }
     }
 
@@ -141,6 +146,13 @@ impl Offset {
     #[must_use]
     pub fn with_held(mut self, held_tables: Vec<TableRef>) -> Self {
         self.held_tables = held_tables;
+        self
+    }
+
+    /// Attaches the last applied signal.
+    #[must_use]
+    pub fn with_last_signal(mut self, last_signal: Option<String>) -> Self {
+        self.last_signal = last_signal;
         self
     }
 
@@ -384,6 +396,21 @@ mod tests {
         let offset: Offset = serde_json::from_str(old).unwrap();
         assert_eq!(offset.snapshotted_tables, None);
         assert_eq!(offset.incremental, None);
+    }
+
+    #[test]
+    fn the_last_signal_is_kept_in_the_file() {
+        let offset = Offset::new(None, "mysql-bin.000001".into(), 4, String::new(), true);
+        assert!(
+            serde_json::to_value(&offset)
+                .unwrap()
+                .get("last_signal")
+                .is_none()
+        );
+        let signalled = offset.with_last_signal(Some("0001-a.json".into()));
+        let json = serde_json::to_string(&signalled).unwrap();
+        let loaded: Offset = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.last_signal.as_deref(), Some("0001-a.json"));
     }
 
     #[test]
