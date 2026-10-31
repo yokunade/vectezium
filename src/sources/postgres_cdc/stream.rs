@@ -252,9 +252,10 @@ async fn session(
     status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut flush = tokio::time::interval(Duration::from_millis(100));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The server sends keepalives at half its `wal_sender_timeout`; silence for much longer means
-    // the connection is gone (a half-open TCP connection never errors on its own). Measured from
-    // the last message, not per `select!` pass: the other branches wake the loop far more often.
+    // An idle server that hears from us sends nothing, so a status update after a quiet interval
+    // asks it for a keepalive; no answer for much longer means the connection is gone (a
+    // half-open TCP connection never errors on its own). Measured from the last message, not per
+    // `select!` pass: the other branches wake the loop far more often.
     let silence = interval * 3 + Duration::from_mins(1);
     let mut last_message = Instant::now();
     if let Some(end) = open_window(state, replication).await? {
@@ -267,7 +268,12 @@ async fn session(
                 if last_message.elapsed() >= silence {
                     return Ok(End::Disconnected(format!("no message from the server for {silence:?}")));
                 }
-                if let Err(error) = replication.status(state.received, state.released).await {
+                let sent = if last_message.elapsed() >= interval {
+                    replication.request_keepalive(state.received, state.released).await
+                } else {
+                    replication.status(state.received, state.released).await
+                };
+                if let Err(error) = sent {
                     return Ok(End::Disconnected(format!("failed to send a status update: {}", error_text(&error))));
                 }
             }
@@ -286,7 +292,9 @@ async fn session(
                 {
                     return Ok(end);
                 }
-                emitter.maybe_flush().await?;
+                if let Some(end) = flush_alive(state, replication, emitter).await? {
+                    return Ok(end);
+                }
                 emitter.check_health()?;
             }
             next = replication.next() => {
@@ -319,11 +327,43 @@ async fn session(
                     Received::Message { message, wal_end } => {
                         state.received = state.received.max(wal_end);
                         handle(state, emitter, message).await?;
-                        emitter.maybe_flush().await?;
+                        if let Some(end) = flush_alive(state, replication, emitter).await? {
+                            return Ok(end);
+                        }
                         if let Some(end) = open_window(state, replication).await? {
                             return Ok(end);
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Sends what is due downstream, which waits while the pipeline applies backpressure, and keeps
+/// sending status updates meanwhile: the server drops a connection that reports nothing for
+/// `wal_sender_timeout`, and the source would then replay the same changes into the same
+/// backpressure. The send always runs to completion; a failed status update ends the session
+/// after it.
+async fn flush_alive(
+    state: &State<'_>,
+    replication: &mut Replication,
+    emitter: &mut Emitter,
+) -> Result<Option<End>, String> {
+    let interval = state.settings.status_interval;
+    let mut status = tokio::time::interval_at(Instant::now() + interval, interval);
+    let flush = emitter.maybe_flush();
+    tokio::pin!(flush);
+    let mut broken = None;
+    loop {
+        tokio::select! {
+            flushed = &mut flush => return flushed.map(|()| broken),
+            _ = status.tick(), if broken.is_none() => {
+                if let Err(error) = replication.status(state.received, state.released).await {
+                    broken = Some(End::Disconnected(format!(
+                        "failed to send a status update: {}",
+                        error_text(&error)
+                    )));
                 }
             }
         }
@@ -448,6 +488,8 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
                         name: c.name().map_err(|e| e.to_string())?.to_owned(),
                         type_oid: c.type_id().cast_unsigned(),
                         typmod: c.type_modifier(),
+                        // Bit 1: part of the replica identity (all columns with FULL).
+                        identity: c.flags() & 1 != 0,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -468,6 +510,7 @@ async fn handle(state: &mut State<'_>, emitter: &mut Emitter, message: M) -> Res
             let captured = state.settings.filters.table_included(&schema, &table);
             if captured {
                 state.settings.warn_if_keyless(&info);
+                state.settings.warn_if_key_outside_identity(&info);
                 let key = (schema.clone(), table.clone());
                 if let Some(previous) = state.known.get(&key)
                     && info.columns_differ(previous)
@@ -665,8 +708,9 @@ fn column_text<'t>(
     }
 }
 
-/// Converts a tuple to a row. `key_only` keeps only the key columns (a key tuple). Unchanged
-/// `TOASTed` columns are written as the placeholder string, bypassing conversion.
+/// Converts a tuple to a row. `key_only` keeps only the replica-identity columns (an old-key
+/// tuple carries no others). Unchanged `TOASTed` columns are written as the placeholder string,
+/// bypassing conversion.
 fn tuple_row(
     settings: &Settings,
     info: &TableInfo,
@@ -676,7 +720,7 @@ fn tuple_row(
 ) -> Result<Map<String, Json>, String> {
     let mut row = Map::with_capacity(info.columns.len());
     for (i, column) in info.columns.iter().enumerate() {
-        if column.excluded || (key_only && !info.key.contains(&i)) {
+        if column.excluded || (key_only && !info.identity.contains(&i)) {
             continue;
         }
         let unchanged = matches!(tuple.tuple_data().get(i), Some(TupleData::UnchangedToast))
@@ -809,10 +853,25 @@ fn row_change_update(
             .map(|t| tuple_row(state.settings, info, t, None, !full))
             .transpose()?;
         let after = tuple_row(state.settings, info, new, old.filter(|_| full), false)?;
-        Ok::<_, String>((before, after))
+        // The server sends the old key only when the identity changed (or always, with FULL).
+        let key_changed = before
+            .as_ref()
+            .is_some_and(|before| row_key(info, before) != row_key(info, &after));
+        if key_changed && !full {
+            unkeyable(info)?;
+        }
+        Ok::<_, String>((before, after, key_changed))
     })();
     match converted {
-        Ok((before, after)) => Ok(Some(push(
+        // Like Debezium: a key change becomes a delete of the old key plus a create of the new
+        // one, so a merge on the event key removes the old row.
+        Ok((before, after, true)) => {
+            let mut touched = push(state, emitter, txn, info, Op::Delete, before, None);
+            let created = push(state, emitter, txn, info, Op::Create, None, Some(after));
+            touched.keys.extend(created.keys);
+            Ok(Some(touched))
+        }
+        Ok((before, after, false)) => Ok(Some(push(
             state,
             emitter,
             txn,
@@ -826,6 +885,19 @@ fn row_change_update(
             .handle_failure(error, &info.schema, &info.table)
             .map(|()| None),
     }
+}
+
+/// Fails when the key has columns an old-key tuple does not carry: the old key is unknown.
+fn unkeyable(info: &TableInfo) -> Result<(), String> {
+    let outside = info.key_outside_identity();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the old row's key is unknown: key columns {} are not in the replica identity (set \
+         REPLICA IDENTITY FULL, or make the identity cover the key)",
+        outside.join(", ")
+    ))
 }
 
 fn row_change_delete(
@@ -849,7 +921,12 @@ fn row_change_delete(
             )
             .map(|()| None);
     };
-    match tuple_row(state.settings, info, old, None, !full) {
+    let converted = if full {
+        tuple_row(state.settings, info, old, None, false)
+    } else {
+        unkeyable(info).and_then(|()| tuple_row(state.settings, info, old, None, true))
+    };
+    match converted {
         Ok(before) => Ok(Some(push(
             state,
             emitter,
