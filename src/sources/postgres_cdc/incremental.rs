@@ -155,6 +155,7 @@ pub async fn read_chunk(
         registry,
         &settings.filters,
         &settings.convert,
+        settings.publishes_generated(),
         schema,
         name,
     )

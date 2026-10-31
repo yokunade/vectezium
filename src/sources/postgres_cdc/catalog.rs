@@ -285,6 +285,8 @@ struct CatalogColumn {
     typmod: i32,
     not_null: bool,
     pk_position: Option<usize>,
+    /// A generated column: pgoutput sends it only if the publication publishes them.
+    generated: bool,
 }
 
 /// The catalog's view of a table: OID, replica identity and columns (in `attnum` order).
@@ -296,7 +298,7 @@ async fn read_table(
     let rows = client
         .query(
             "SELECT c.oid, c.relreplident::text, a.attname, a.atttypid, a.atttypmod, a.attnotnull, \
-                    array_position(i.indkey::int2[], a.attnum) \
+                    array_position(i.indkey::int2[], a.attnum), a.attgenerated <> '' \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped \
@@ -322,6 +324,7 @@ async fn read_table(
             pk_position: row
                 .get::<_, Option<i32>>(6)
                 .and_then(|p| usize::try_from(p).ok()),
+            generated: row.get(7),
         })
         .collect();
     Ok(Some((
@@ -342,11 +345,16 @@ pub struct RelationColumn {
 
 impl TableInfo {
     /// Reads a table from the catalog (for the snapshot). `None` if it does not exist.
+    ///
+    /// Generated columns are left out unless `generated` (the publication publishes them), so
+    /// snapshot rows have the columns the stream's `Relation` messages describe.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_catalog(
         client: &Client,
         registry: &TypeRegistry,
         filters: &Filters,
         convert: &ConvertOptions,
+        generated: bool,
         schema: &str,
         table: &str,
     ) -> Result<Option<Self>, String> {
@@ -355,6 +363,7 @@ impl TableInfo {
         };
         let columns = catalog
             .into_iter()
+            .filter(|c| generated || !c.generated)
             .map(|c| RelationColumn {
                 name: c.name.clone(),
                 type_oid: c.type_oid,
@@ -507,6 +516,24 @@ pub async fn filtered_tables(
         .iter()
         .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
         .filter(|(schema, table)| filters.table_included(schema, table))
+        .collect())
+}
+
+/// The partitioned tables (not partitions themselves). Sorted.
+pub async fn partitioned_tables(client: &Client) -> Result<Vec<(String, String)>, String> {
+    let rows = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'p' AND NOT c.relispartition \
+             ORDER BY 1, 2",
+            &[],
+        )
+        .await
+        .map_err(|error| format!("failed to list partitioned tables: {error}"))?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
         .collect())
 }
 
