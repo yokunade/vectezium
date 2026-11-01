@@ -60,21 +60,6 @@ AZURITE_ADDRESS=localhost cargo test --locked --lib --no-default-features \
   --features azure-blob-integration-tests -- sinks::azure_blob::integration_tests
 ```
 
-## Test a release binary end to end (Docker, MySQL)
-
-The integration tests above cover the source itself. This script runs a release binary with a
-whole pipeline, and also checks the blobs the `azure_blob` sink writes.
-
-```bash
-cd contrib/mysql_cdc
-./run-e2e.sh ../../target/release/vector
-```
-
-This starts MySQL 8.4 (configured for CDC) and Azurite (a local Blob/ADLS emulator), runs
-`vector-e2e.yaml`, and checks the snapshot, type conversions, inserts/updates/deletes, primary-key
-changes, rolled-back transactions, DDL, filters, restart/resume, the single-writer lock, and the gzip NDJSON blobs written
-to Azurite. Requires Docker and `jq`.
-
 ## Load test (Docker, MySQL)
 
 ```bash
@@ -856,5 +841,6 @@ Also changed: `src/sinks/azure_blob/` (`blob_extension`, `blob_overwrite`,
 `blob_overwrite_order_by`), `Cargo.toml` and `Cargo.lock` (the `mysql_async` and Materialize
 `rust-postgres` dependencies, and the `sources-mysql_cdc` and `sources-postgres_cdc` features),
 `LICENSE-3rdparty.csv`, and `.github/workflows/vectezium.yml` (CI). `contrib/mysql_cdc/` holds
-this README, the Docker test environment, the MySQL test and benchmark scripts and the example
-configs.
+this README, the Docker environment and scripts of the MySQL load, readiness and snapshot
+benchmarks, and the example configs; the integration tests' servers are in
+`tests/integration/cdc/`.
