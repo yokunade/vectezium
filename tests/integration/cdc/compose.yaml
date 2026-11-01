@@ -1,0 +1,42 @@
+# Servers for the CDC integration tests (the `postgres_cdc-integration-tests` feature):
+#
+#   docker compose -f tests/integration/cdc/compose.yaml up -d --wait
+#   cargo test --lib --no-default-features --features postgres_cdc-integration-tests -- \
+#     sources::postgres_cdc::integration_tests
+#
+# PG_VERSION picks the PostgreSQL image (default 17); PG_PORT and AZURITE_PORT the host ports.
+# The tests read PG_CDC_HOST, PG_CDC_PORT and AZURITE_ADDRESS (default: localhost, 5432).
+# Every test creates its own database and slot, so tests run in parallel against one server.
+name: vectezium-cdc-it
+
+services:
+  postgres:
+    image: postgres:${PG_VERSION:-17}
+    environment:
+      POSTGRES_PASSWORD: postgres
+    # A short wal_sender_timeout makes the tests for silent connections and stalled sinks fast;
+    # the tests report their position every second.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=100
+      - -c
+      - max_wal_senders=100
+      - -c
+      - max_connections=400
+      - -c
+      - wal_sender_timeout=5s
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 60
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.37.0
+    command: azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+    ports:
+      - "127.0.0.1:${AZURITE_PORT:-10000}:10000"
