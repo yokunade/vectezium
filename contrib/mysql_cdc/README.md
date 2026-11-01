@@ -12,8 +12,8 @@ lock and offset recovery. Where they differ, the section says so. The connector-
 are [MySQL](#mysql) and [PostgreSQL](#postgresql).
 
 > **Status: tested locally and in CI.** Built on Vector v0.60.0. Unit tests pass in CI, and so
-> do the `postgres_cdc` integration tests against PostgreSQL 13, 17 and 18 with Azurite;
-> `run-e2e.sh` passes against MySQL 8.4 and Azurite. Not yet tested against Azure Database for
+> do the integration tests against PostgreSQL 13, 17 and 18 and MySQL 8.0 and 8.4, with
+> Azurite. Not yet tested against Azure Database for
 > MySQL or PostgreSQL or real ADLS, or for long runs.
 
 ## Build
@@ -39,15 +39,17 @@ needs Rust (the version in `rust-toolchain.toml`), `protoc`, `clang` and `cmake`
 `docs/DEVELOPING.md`. CI (`.github/workflows/vectezium.yml`) also runs `cargo fmt --check` and
 clippy with `-D warnings`.
 
-The `postgres_cdc` integration tests run against a real PostgreSQL and Azurite, from
-`tests/integration/cdc/compose.yaml` (`PG_VERSION` picks the version, default 17). Each test
-uses its own database and slot; recreate the servers (`down -v`) between local runs, as every
-run leaves its slots behind. CI runs them on PostgreSQL 13, 17 and 18
-(`.github/workflows/vectezium-integration.yml`).
+The integration tests run each source in the test process against a real PostgreSQL or MySQL,
+and Azurite, from `tests/integration/cdc/compose.yaml` (`PG_VERSION` and `MYSQL_VERSION` pick
+the versions, default 17 and 8.4). Each test uses its own database (and slot, or replica server
+ID), so they run in parallel; recreate the servers (`down -v`) between local runs, as every run
+leaves its databases and slots behind. CI runs them on PostgreSQL 13, 17 and 18 and MySQL 8.0
+and 8.4 (`.github/workflows/vectezium-integration.yml`).
 
 ```bash
 docker compose -f tests/integration/cdc/compose.yaml up -d --wait
 cargo test --locked --lib --no-default-features --features postgres_cdc-integration-tests --   sources::postgres_cdc::integration_tests
+cargo test --locked --lib --no-default-features --features mysql_cdc-integration-tests --   sources::mysql_cdc::integration_tests
 ```
 
 The `azure_blob` integration tests, including the ones for the options Vectezium adds, run
@@ -58,7 +60,10 @@ AZURITE_ADDRESS=localhost cargo test --locked --lib --no-default-features \
   --features azure-blob-integration-tests -- sinks::azure_blob::integration_tests
 ```
 
-## Test end to end (Docker, MySQL)
+## Test a release binary end to end (Docker, MySQL)
+
+The integration tests above cover the source itself. This script runs a release binary with a
+whole pipeline, and also checks the blobs the `azure_blob` sink writes.
 
 ```bash
 cd contrib/mysql_cdc

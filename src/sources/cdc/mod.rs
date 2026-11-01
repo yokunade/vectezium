@@ -43,6 +43,14 @@ pub mod control;
 pub mod emitter;
 pub mod envelope;
 pub mod filter;
+#[cfg(all(
+    test,
+    any(
+        feature = "mysql_cdc-integration-tests",
+        feature = "postgres_cdc-integration-tests"
+    )
+))]
+pub(crate) mod integration_test_util;
 pub mod lock;
 pub mod recovery;
 pub mod seq;

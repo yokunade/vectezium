@@ -32,6 +32,8 @@ mod convert;
 mod ddl;
 mod envelope;
 mod incremental;
+#[cfg(all(test, feature = "mysql_cdc-integration-tests"))]
+mod integration_tests;
 mod offset;
 mod schema;
 mod snapshot;
