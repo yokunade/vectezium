@@ -382,11 +382,12 @@ pub(super) async fn inspect_server(conn: &mut Conn) -> Result<ServerInfo, String
             row_metadata.unwrap_or_default()
         ));
     }
+    // Incomplete images would blank out real values downstream: the first change fails anyway.
     if !is(&row_image, "FULL") {
-        warn!(
-            message = "`binlog_row_image` is not FULL; `before` images and unchanged columns will be incomplete.",
-            binlog_row_image = %row_image.unwrap_or_default(),
-        );
+        return Err(format!(
+            "`binlog_row_image` must be FULL (current: {}); run `SET PERSIST binlog_row_image = 'FULL'`",
+            row_image.unwrap_or_default()
+        ));
     }
 
     // Partial JSON updates cannot be turned into full `after` images.
