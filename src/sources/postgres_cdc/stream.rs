@@ -214,6 +214,7 @@ async fn known_tables(
             registry,
             &settings.filters,
             &settings.convert,
+            settings.publishes_generated(),
             schema,
             table,
         )

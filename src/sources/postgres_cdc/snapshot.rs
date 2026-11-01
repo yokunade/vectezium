@@ -93,6 +93,7 @@ pub(super) async fn run(
             registry,
             &settings.filters,
             &settings.convert,
+            settings.publishes_generated(),
             schema,
             table,
         )

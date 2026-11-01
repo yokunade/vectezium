@@ -115,7 +115,9 @@ pub enum PublicationAutocreateMode {
     Disabled,
 
     /// Create the publication for the tables the include/exclude lists capture, if it does not
-    /// exist. Needs ownership of those tables (or superuser).
+    /// exist. Needs ownership of those tables (or superuser). Created with
+    /// `publish_via_partition_root = true`, so a partitioned table's changes are captured as
+    /// the table's.
     ///
     /// Once a table is published, PostgreSQL rejects every `UPDATE` and `DELETE` on it unless it
     /// has a replica identity (a primary key, `REPLICA IDENTITY USING INDEX` or `FULL`). Tables
@@ -124,7 +126,8 @@ pub enum PublicationAutocreateMode {
     #[default]
     Filtered,
 
-    /// Create the publication `FOR ALL TABLES`, if it does not exist. Needs superuser.
+    /// Create the publication `FOR ALL TABLES` (with `publish_via_partition_root = true`), if it
+    /// does not exist. Needs superuser.
     ///
     /// Refused while any table in the database lacks a replica identity: PostgreSQL would reject
     /// every `UPDATE` and `DELETE` on it. Tables created later are published too, so give each
@@ -268,6 +271,11 @@ pub struct PostgresCdcConfig {
 
     /// The logical replication slot. Created (with `pgoutput`) on the first start. Unique per
     /// source: two sources must never share a slot.
+    ///
+    /// The source only drops and re-creates an existing slot (to snapshot again) when its own
+    /// stored offset names the slot, or the slot was invalidated. Finding the slot without such
+    /// an offset (another source's slot, or this source's offsets lost without
+    /// `offset_recovery`), it stops with an error instead.
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
 

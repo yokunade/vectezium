@@ -5,7 +5,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -87,9 +90,17 @@ pub(super) struct Settings {
     pub signals: Option<SignalsConfig>,
     /// Tables already reported as having no key (or a key outside the replica identity).
     pub warned_no_key: Mutex<HashSet<String>>,
+    /// Whether the publication publishes generated columns (`publish_generated_columns`,
+    /// PostgreSQL 18), read at start-up.
+    pub generated_columns: AtomicBool,
 }
 
 impl Settings {
+    /// Whether generated columns are streamed, so snapshots include them too.
+    pub fn publishes_generated(&self) -> bool {
+        self.generated_columns.load(Ordering::Relaxed)
+    }
+
     /// Warns once per table that has neither a primary key nor `pk_override`.
     pub fn warn_if_keyless(&self, info: &TableInfo) {
         if !info.key.is_empty() {
@@ -358,6 +369,7 @@ pub(super) fn build(config: &PostgresCdcConfig, cx: SourceContext) -> crate::Res
         status_interval: Duration::from_secs(config.status_update_interval_secs.max(1)),
         signals: config.signals.clone(),
         warned_no_key: Mutex::default(),
+        generated_columns: AtomicBool::new(false),
     };
 
     let acknowledgements = cx.do_acknowledgements(config.acknowledgements);
@@ -517,6 +529,57 @@ fn names(tables: &[TableRef]) -> String {
         .join(", ")
 }
 
+/// The options a publication is created with: a partitioned table's changes are published as
+/// the table's (not its partitions'), as it is captured and snapshotted.
+const PUBLICATION_OPTIONS: &str = "WITH (publish_via_partition_root = true)";
+
+/// Reads the publication's options: records whether it publishes generated columns, and warns
+/// if partitioned tables it publishes are published as their partitions.
+async fn check_publication(
+    client: &Client,
+    settings: &Settings,
+    captured: &[TableRef],
+) -> Result<(), String> {
+    let name = &settings.publication_name;
+    // `pubgencols` only exists from PostgreSQL 18: read through JSON, it is null before.
+    let row = client
+        .query_one(
+            "SELECT p.pubviaroot, coalesce(to_jsonb(p)->>'pubgencols', 'n') = 's' \
+             FROM pg_publication p WHERE p.pubname = $1",
+            &[name],
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to read publication `{name}`: {}",
+                error_text(&error)
+            )
+        })?;
+    let via_root: bool = row.get(0);
+    settings
+        .generated_columns
+        .store(row.get(1), Ordering::Relaxed);
+    if !via_root {
+        let wanted = catalog::filtered_tables(client, &settings.filters).await?;
+        let partitioned: Vec<TableRef> = catalog::partitioned_tables(client)
+            .await?
+            .into_iter()
+            .filter(|t| wanted.contains(t) && !captured.contains(t))
+            .collect();
+        if !partitioned.is_empty() {
+            warn!(
+                message = "Partitioned tables are not captured: the publication publishes their \
+                           changes as their partitions'. Run ALTER PUBLICATION … SET \
+                           (publish_via_partition_root = true).",
+                publication = %name,
+                tables = %names(&partitioned),
+                internal_log_rate_limit = false,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Makes sure the publication exists (creating it per `publication_autocreate_mode`) and warns
 /// about captured tables it does not include.
 async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), String> {
@@ -552,7 +615,10 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
                     ));
                 }
                 (
-                    format!("CREATE PUBLICATION {} FOR ALL TABLES", quote_ident(name)),
+                    format!(
+                        "CREATE PUBLICATION {} FOR ALL TABLES {PUBLICATION_OPTIONS}",
+                        quote_ident(name)
+                    ),
                     wanted.len(),
                 )
             }
@@ -582,7 +648,7 @@ async fn ensure_publication(client: &Client, settings: &Settings) -> Result<(), 
                     .join(", ");
                 (
                     format!(
-                        "CREATE PUBLICATION {} FOR TABLE {tables}",
+                        "CREATE PUBLICATION {} FOR TABLE {tables} {PUBLICATION_OPTIONS}",
                         quote_ident(name)
                     ),
                     published.len(),
@@ -785,6 +851,7 @@ async fn run(
             publication = %settings.publication_name,
         );
     }
+    check_publication(&query, &settings, &captured).await?;
     check_replica_identity(&query, &settings, &captured).await;
 
     let poisoned = Arc::new(AtomicBool::new(false));
@@ -922,14 +989,40 @@ async fn run(
     let start = if let Some(offset) = resume {
         offset
     } else {
-        // Starting over: a leftover slot cannot give a snapshot, so it is replaced.
+        // Starting over: a leftover slot cannot give a snapshot, so it is replaced, but only if
+        // it is this source's: another source on the database may be using the slot name.
+        let ours = stored
+            .as_ref()
+            .is_some_and(|offset| offset.slot_name == settings.slot_name);
         if slot != SlotState::Missing {
+            if !ours && slot != SlotState::Lost {
+                return Err(format!(
+                    "replication slot `{slot_name}` exists, but this source has no stored offset \
+                     for it: it may be another source's (give each source on a database its own \
+                     `slot_name`). If it is this source's and its offsets were lost, configure \
+                     `offset_recovery`, or drop the slot (SELECT \
+                     pg_drop_replication_slot('{slot_name}')) to start over with a snapshot",
+                    slot_name = settings.slot_name
+                ));
+            }
             info!(message = "Dropping the replication slot to create it again with a snapshot.", slot = %settings.slot_name);
             drop_slot(&query, &settings).await?;
         }
+        if !ours {
+            // Stored before the slot is created, so the next start knows the slot is this
+            // source's (and replaces it) if this start stops before storing another offset.
+            let mut claim = Offset::new(Lsn(0), &settings.slot_name, Some(system_id.clone()));
+            if let Some(offset) = &stored {
+                (claim.next_seq, claim.seq_sub) = (offset.next_seq, offset.seq_sub);
+            }
+            CheckpointStore::new(&data_dir)
+                .store(&claim)
+                .await
+                .map_err(|error| format!("failed to store an offset in {offset_file}: {error}"))?;
+        }
         let snapshotting = stored.is_some() || settings.snapshot_mode != SnapshotMode::NoData;
         if snapshotting && settings.snapshot_strategy == SnapshotStrategy::Blocking {
-            let completed = snapshot::run(
+            let completed = match snapshot::run(
                 Arc::clone(&settings),
                 &query,
                 &registry,
@@ -938,7 +1031,18 @@ async fn run(
                 &system_id,
                 shutdown.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(completed) => completed,
+                Err(error) => {
+                    // The slot would keep its WAL until the next start; that start drops it and
+                    // snapshots again anyway.
+                    if let Err(drop_error) = drop_slot(&query, &settings).await {
+                        warn!(message = "Could not drop the failed snapshot's replication slot.", slot = %settings.slot_name, error = %drop_error);
+                    }
+                    return Err(error);
+                }
+            };
             let Some(offset) = completed else {
                 // Shut down mid-snapshot; it is taken again on the next start.
                 return emitter.close().await;
