@@ -297,6 +297,39 @@ impl Parser {
         })
     }
 
+    /// The new name in the rest of an `ALTER TABLE`, if it renames the table
+    /// (`RENAME [TO | AS] name`, not `RENAME COLUMN`, `RENAME INDEX` or `RENAME KEY`).
+    fn alter_rename(&self) -> Option<ObjectName> {
+        let mut depth = 0usize;
+        // At the start of an alter option (the first token, or after a top-level comma).
+        let mut option_start = true;
+        for i in self.pos..self.tokens.len() {
+            match &self.tokens[i] {
+                Token::Punct('(') => depth += 1,
+                Token::Punct(')') => depth = depth.saturating_sub(1),
+                Token::Punct(',') if depth == 0 => {
+                    option_start = true;
+                    continue;
+                }
+                Token::Word(word, _) if depth == 0 && option_start && word == "RENAME" => {
+                    let mut rest = Self {
+                        tokens: self.tokens[i + 1..].to_vec(),
+                        pos: 0,
+                    };
+                    if !matches!(rest.word(), Some("COLUMN" | "INDEX" | "KEY")) {
+                        if !rest.eat("TO") {
+                            rest.eat("AS");
+                        }
+                        return rest.object_name();
+                    }
+                }
+                _ => {}
+            }
+            option_start = false;
+        }
+        None
+    }
+
     /// Advances to the next top-level `ON` keyword and reads the table name after it.
     fn on_table(&mut self) -> Option<ObjectName> {
         while self.pos < self.tokens.len() {
@@ -412,6 +445,19 @@ pub fn classify(sql: &str) -> Option<Ddl> {
             };
             let data_changed =
                 verb == "ALTER" && kind == DdlKind::Table && p.partition_data_change();
+            // `ALTER TABLE a RENAME TO b` is tracked like `RENAME TABLE a TO b`.
+            if verb == "ALTER"
+                && kind == DdlKind::Table
+                && let [from] = objects.as_slice()
+                && let Some(to) = p.alter_rename()
+            {
+                return Some(Ddl {
+                    verb: "RENAME",
+                    kind,
+                    objects: vec![from.clone(), to],
+                    data_changed,
+                });
+            }
             let verb = match verb.as_str() {
                 "CREATE" => "CREATE",
                 "ALTER" => "ALTER",
@@ -586,6 +632,35 @@ mod tests {
         assert_eq!(classify("drop table t").unwrap().verb, "DROP");
         assert_eq!(classify("ALTER TABLE t ADD c INT").unwrap().verb, "ALTER");
         assert_eq!(classify("RENAME TABLE a TO b").unwrap().verb, "RENAME");
+        for (sql, to) in [
+            ("ALTER TABLE a RENAME TO b", "b"),
+            ("ALTER TABLE a RENAME b", "b"),
+            ("ALTER TABLE shop.a RENAME AS other.b", "b"),
+            ("ALTER TABLE a ADD COLUMN c INT, RENAME TO `b`", "b"),
+            ("ALTER TABLE a RENAME COLUMN x TO y, RENAME TO b", "b"),
+        ] {
+            let ddl = classify(sql).unwrap();
+            assert_eq!(ddl.verb, "RENAME", "{sql}");
+            assert_eq!(ddl.objects.len(), 2, "{sql}");
+            assert_eq!(ddl.objects[1].name.as_deref(), Some(to), "{sql}");
+        }
+        assert_eq!(
+            classify("ALTER TABLE shop.a RENAME AS other.b")
+                .unwrap()
+                .objects[1]
+                .db
+                .as_deref(),
+            Some("other")
+        );
+        for sql in [
+            "ALTER TABLE a RENAME COLUMN x TO y",
+            "ALTER TABLE a RENAME INDEX i TO j",
+            "ALTER TABLE a RENAME KEY i TO j",
+            "ALTER TABLE a ADD COLUMN rename INT",
+            "ALTER TABLE a ADD CONSTRAINT c CHECK (x IN ('RENAME')), ALGORITHM = INPLACE",
+        ] {
+            assert_eq!(classify(sql).unwrap().verb, "ALTER", "{sql}");
+        }
         assert_eq!(classify("TRUNCATE t").unwrap().verb, "TRUNCATE");
     }
 

@@ -150,14 +150,16 @@ pub fn convert_value(
             decimal(column, &text, opts)
         }
         ColKind::Date => match value {
-            Value::Date(y, m, d, ..) => {
-                Ok(date_days(*y, *m, *d).map_or(Json::Null, |days| json!(days)))
-            }
+            Value::Date(y, m, d, ..) => Ok(date_days(*y, *m, *d)
+                .map_or_else(|| zero_date(column, json!(0)), |days| json!(days))),
             Value::Bytes(b) => {
                 let s = parse_str(column, b)?;
                 Ok(NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
                     .ok()
-                    .map_or(Json::Null, |d| json!(days_since_epoch(d))))
+                    .map_or_else(
+                        || zero_date(column, json!(0)),
+                        |d| json!(days_since_epoch(d)),
+                    ))
             }
             other => err(column, format!("unexpected value {other:?}")),
         },
@@ -179,8 +181,7 @@ pub fn convert_value(
         ColKind::DateTime => match value {
             Value::Date(y, mo, d, h, mi, s, us) => {
                 let Some(dt) = naive_datetime(*y, *mo, *d, *h, *mi, *s, *us) else {
-                    // Zero or otherwise invalid dates are emitted as null, like Debezium.
-                    return Ok(Json::Null);
+                    return Ok(zero_date(column, json!(0)));
                 };
                 let micros = dt.and_utc().timestamp_micros();
                 let use_micros = opts.time_precision == TimePrecisionMode::AdaptiveTimeMicroseconds
@@ -423,7 +424,15 @@ fn naive_datetime(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> Optio
     Some(NaiveDateTime::new(date, time))
 }
 
+/// A zero (`0000-00-00`) or otherwise invalid date, datetime or timestamp, as Debezium emits it:
+/// null if the column is nullable, otherwise the epoch (`epoch`). The same in snapshots and in
+/// the binlog.
+fn zero_date(column: &ColumnDesc, epoch: Json) -> Json {
+    if column.nullable { Json::Null } else { epoch }
+}
+
 fn timestamp(column: &ColumnDesc, value: &Value, origin: Origin) -> Result<Json, ConvertError> {
+    let zero = || zero_date(column, Json::String(format_zoned_timestamp(0, column.fsp)));
     let micros: i64 = match (origin, value) {
         // Binlog TIMESTAMP2 values are "<epoch seconds>[.<microseconds>]".
         (Origin::Binlog, Value::Bytes(bytes)) => {
@@ -442,11 +451,15 @@ fn timestamp(column: &ColumnDesc, value: &Value, origin: Origin) -> Result<Json,
         (_, Value::Date(y, mo, d, h, mi, s, us)) => {
             match naive_datetime(*y, *mo, *d, *h, *mi, *s, *us) {
                 Some(dt) => dt.and_utc().timestamp_micros(),
-                None => return Ok(Json::Null),
+                None => return Ok(zero()),
             }
         }
         (_, other) => return err(column, format!("unexpected value {other:?}")),
     };
+    // A TIMESTAMP starts at 1970-01-01 00:00:01 UTC: the binlog logs the zero value as 0.
+    if micros == 0 {
+        return Ok(zero());
+    }
     Ok(Json::String(format_zoned_timestamp(micros, column.fsp)))
 }
 
@@ -497,9 +510,26 @@ fn set_value(column: &ColumnDesc, bitmap: &[u8]) -> String {
 /// `MySQL` character-set ids that use the latin1 repertoire.
 const LATIN1_CHARSETS: &[u16] = &[5, 8, 15, 31, 47, 48, 49, 94];
 
+/// `MySQL`'s latin1 is cp1252 (not ISO-8859-1): bytes 0x80 to 0x9F hold `€`, curly quotes and
+/// the like. The five bytes cp1252 leaves undefined stay C1 controls, as in `MySQL`.
+const CP1252_80_9F: [char; 32] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}',
+    '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+];
+
+/// Decodes text the binlog carries in the column's character set (snapshot reads get UTF-8 from
+/// the server).
 pub fn decode_text(bytes: &[u8], charset: u16) -> String {
     if LATIN1_CHARSETS.contains(&charset) {
-        bytes.iter().map(|b| char::from(*b)).collect()
+        bytes
+            .iter()
+            .map(|&b| match b {
+                0x80..=0x9F => CP1252_80_9F[usize::from(b - 0x80)],
+                _ => char::from(b),
+            })
+            .collect()
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     }
@@ -535,6 +565,39 @@ mod tests {
             set_values: None,
             primary_key: false,
             excluded: false,
+        }
+    }
+
+    #[test]
+    fn zero_dates_are_the_same_in_snapshots_and_the_binlog() {
+        let o = opts();
+        let zero = Value::Date(0, 0, 0, 0, 0, 0, 0);
+        for nullable in [true, false] {
+            for (kind, epoch) in [
+                (ColKind::Date, json!(0)),
+                (ColKind::DateTime, json!(0)),
+                (ColKind::Timestamp, json!("1970-01-01T00:00:00Z")),
+            ] {
+                let mut column = col(kind);
+                column.nullable = nullable;
+                let expected = if nullable { Json::Null } else { epoch };
+                // Snapshots read the zero value as a date; the binlog logs a zero TIMESTAMP as 0.
+                let binlog = if kind == ColKind::Timestamp {
+                    Value::Int(0)
+                } else {
+                    zero.clone()
+                };
+                assert_eq!(
+                    convert_value(&column, &zero, Origin::Snapshot, o).unwrap(),
+                    expected,
+                    "{kind:?} nullable={nullable}"
+                );
+                assert_eq!(
+                    convert_value(&column, &binlog, Origin::Binlog, o).unwrap(),
+                    expected,
+                    "{kind:?} nullable={nullable}"
+                );
+            }
         }
     }
 
@@ -683,6 +746,17 @@ mod tests {
         assert_eq!(
             convert_value(&latin1, &Value::Bytes(vec![0x68, 0xE9]), Origin::Binlog, o).unwrap(),
             json!("hé")
+        );
+        // cp1252, as MySQL decodes latin1: the euro sign, curly quotes, an undefined byte.
+        assert_eq!(
+            convert_value(
+                &latin1,
+                &Value::Bytes(vec![0x80, 0x93, 0x61, 0x94, 0x81]),
+                Origin::Binlog,
+                o
+            )
+            .unwrap(),
+            json!("€\u{201C}a\u{201D}\u{81}")
         );
         let mut bin = col(ColKind::String);
         bin.charset = 63;
