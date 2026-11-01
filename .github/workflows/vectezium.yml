@@ -1,5 +1,6 @@
-# Vectezium: builds the CDC features and runs their unit tests. Vector's own workflows assume
-# Datadog's secrets and runners; disable them in this fork's Actions settings.
+# Vectezium: checks formatting and the licence list, then builds the CDC features and runs their
+# unit tests. Vector's own workflows assume Datadog's secrets and runners; they are disabled in
+# this fork's Actions settings.
 name: Vectezium
 
 on:
@@ -31,7 +32,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang cmake libclang-dev protobuf-compiler
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: LICENSE-3rdparty.csv has four columns on every row
+        run: >
+          python3 -c "import csv, sys;
+          bad = [n for n, row in enumerate(csv.reader(open('LICENSE-3rdparty.csv')), 1) if len(row) != 4];
+          sys.exit(f'rows with the wrong number of columns (quote fields that contain commas): {bad}' if bad else 0)"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Clippy
         run: cargo clippy --locked --lib --tests --no-default-features --features "$FEATURES" -- -D warnings
       - name: Unit tests
