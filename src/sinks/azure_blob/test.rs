@@ -44,6 +44,7 @@ fn default_config(encoding: EncodingConfigWithFraming) -> AzureBlobSinkConfig {
         blob_append_uuid: None,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::default(),
         encoding,
         compression: Compression::gzip_default(),
@@ -87,6 +88,7 @@ fn azure_blob_build_request_without_compression() {
         blob_append_uuid,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -140,6 +142,7 @@ fn azure_blob_build_request_with_compression() {
         blob_append_uuid,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -193,6 +196,7 @@ fn azure_blob_build_request_with_compression_with_custom_extension() {
         blob_append_uuid,
         blob_extension: Some("json.gz".to_string()),
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -247,6 +251,7 @@ fn azure_blob_build_request_with_time_format() {
         blob_append_uuid,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -303,6 +308,7 @@ fn azure_blob_build_request_with_uuid() {
         blob_append_uuid,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -641,6 +647,7 @@ fn azure_blob_build_request_with_blob_tags() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -700,6 +707,7 @@ fn azure_blob_build_request_with_blob_metadata() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -753,6 +761,7 @@ fn azure_blob_build_request_with_empty_blob_tags_and_metadata() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -802,6 +811,7 @@ fn azure_blob_build_request_append_blob_defaults() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1075,6 +1085,7 @@ fn azure_blob_append_blob_naming_defaults_are_hourly() {
         blob_append_uuid: None,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
     };
 
@@ -1093,6 +1104,7 @@ fn azure_blob_block_blob_naming_defaults_unchanged() {
         blob_append_uuid: None,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         ..default_config((None::<FramingConfig>, TextSerializerConfig::default()).into())
     };
 
@@ -1125,6 +1137,7 @@ fn azure_blob_build_request_append_blob_with_compression() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1211,6 +1224,7 @@ fn azure_blob_block_blob_request_carries_block_type() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Block,
         encoder: (
             Transformer::default(),
@@ -1261,6 +1275,7 @@ fn azure_blob_append_blob_with_uuid_override_generates_unique_keys() {
             blob_append_uuid: true, // explicit override: UUID even for append type
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Append,
             encoder: (
                 Transformer::default(),
@@ -1320,6 +1335,7 @@ fn azure_blob_append_blob_stable_name_without_uuid_and_time() {
             blob_append_uuid: false,         // no UUID
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Append,
             encoder: (
                 Transformer::default(),
@@ -1384,6 +1400,7 @@ fn azure_blob_append_blob_compression_change_rotates_blob_name() {
             blob_append_uuid: false,
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Append,
             encoder: (
                 Transformer::default(),
@@ -1462,6 +1479,7 @@ fn azure_blob_append_blob_custom_time_format_hourly_rotation() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1766,6 +1784,7 @@ fn azure_blob_build_request_append_blob_with_tags_and_metadata() {
         blob_append_uuid: false,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         blob_type: AzureBlobType::Append,
         encoder: (
             Transformer::default(),
@@ -1810,6 +1829,34 @@ fn validates_blob_extension() {
     };
     assert!(crate::config::ValidatedSink::validate(&config_with("json.gz")).is_ok());
     for bad in ["", ".json", "a/b"] {
+        assert!(
+            crate::config::ValidatedSink::validate(&config_with(bad)).is_err(),
+            "{bad:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn validates_blob_overwrite_order_by() {
+    let config_with = |extra: &str| -> AzureBlobSinkConfig {
+        toml::from_str(&format!(
+            r#"
+                connection_string = "AccountName=mylogstorage"
+                container_name = "my-logs"
+                encoding.codec = "json"
+                {extra}
+            "#
+        ))
+        .unwrap()
+    };
+    let ok = "blob_overwrite = true\ncompression = \"none\"\nblob_overwrite_order_by = [\"seq\"]";
+    assert!(crate::config::ValidatedSink::validate(&config_with(ok)).is_ok());
+    for bad in [
+        "compression = \"none\"\nblob_overwrite_order_by = [\"seq\"]",
+        "blob_overwrite = true\nblob_overwrite_order_by = [\"seq\"]",
+        "blob_overwrite = true\ncompression = \"none\"\nblob_overwrite_order_by = []",
+        "blob_overwrite = true\ncompression = \"none\"\nblob_type = \"append\"\nblob_overwrite_order_by = [\"seq\"]",
+    ] {
         assert!(
             crate::config::ValidatedSink::validate(&config_with(bad)).is_err(),
             "{bad:?} should be rejected"

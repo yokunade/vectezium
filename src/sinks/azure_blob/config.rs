@@ -223,6 +223,19 @@ pub struct AzureBlobSinkConfig {
     #[serde(default)]
     pub blob_overwrite: bool,
 
+    /// With `blob_overwrite`, replace an existing blob only if the new one does not order before
+    /// it: both are JSON objects (one event per blob: `batch.max_events: 1`, no compression)
+    /// compared by these fields in turn. Numbers compare as numbers, strings as text, and a
+    /// missing field orders first.
+    ///
+    /// Writes are conditional on the existing blob's `ETag`, so concurrent or retried uploads
+    /// (an older request that lands after a newer one) never replace a newer blob. For example
+    /// `["seq", "committed_at"]` keeps a CDC source's latest published offset from going
+    /// backwards. A writer that starts its numbering over must remove the blob first.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "seq"))]
+    pub blob_overwrite_order_by: Option<Vec<String>>,
+
     /// The type of blob to use when writing to Azure Blob Storage.
     ///
     /// - `block` (default): each batch creates a new uniquely-named blob.
@@ -346,6 +359,7 @@ impl GenerateConfig for AzureBlobSinkConfig {
             blob_append_uuid: Some(true),
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Block,
             encoding: (Some(NewlineDelimitedEncoderConfig::new()), JsonSerializerConfig::default()).into(),
             compression: Compression::gzip_default(),
@@ -414,6 +428,22 @@ impl ValidatedSink for AzureBlobSinkConfig {
     )]
     fn validate(&self) -> crate::Result<ValidatedAzureBlob> {
         self.encoding.validate()?;
+        if let Some(fields) = &self.blob_overwrite_order_by {
+            let problem = if fields.is_empty() {
+                Some("needs at least one field")
+            } else if !self.blob_overwrite {
+                Some("needs `blob_overwrite: true`")
+            } else if self.blob_type != AzureBlobType::Block {
+                Some("needs `blob_type: block`")
+            } else if self.compression != Compression::None {
+                Some("needs `compression: none` (the blobs are compared as JSON)")
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                return Err(format!("`blob_overwrite_order_by` {problem}").into());
+            }
+        }
         if self.blob_type == AzureBlobType::Append && !supports_append(self.compression) {
             // An error rather than a warning because of zlib: standard zlib decoders return only
             // the first block and report success, so the loss is invisible to the consumer.
@@ -611,6 +641,7 @@ impl AzureBlobSinkConfig {
             blob_append_uuid: validated.blob_append_uuid,
             blob_extension: self.blob_extension.clone(),
             blob_overwrite: self.blob_overwrite,
+            blob_overwrite_order_by: self.blob_overwrite_order_by.clone().map(Into::into),
             blob_type: self.blob_type,
             encoder: (self.encoding.transformer(), encoder),
             compression: self.compression,
@@ -742,6 +773,7 @@ mod tests {
             blob_append_uuid: None,
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Block,
             encoding: (
                 Some(NewlineDelimitedEncoderConfig::new()),
@@ -815,6 +847,7 @@ mod tests {
             blob_append_uuid: None,
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Block,
             encoding: (
                 Some(NewlineDelimitedEncoderConfig::new()),
@@ -884,6 +917,7 @@ mod tests {
             blob_append_uuid: None,
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Block,
             encoding: (
                 Some(NewlineDelimitedEncoderConfig::new()),
@@ -1005,6 +1039,8 @@ pub struct AzureBlobRequest {
     pub blob_type: AzureBlobType,
     /// Replace an existing block blob instead of failing with `409 Conflict`.
     pub overwrite: bool,
+    /// Replace it only if the new blob does not order before it by these JSON fields.
+    pub overwrite_order_by: Option<Arc<[String]>>,
 }
 
 impl Finalizable for AzureBlobRequest {

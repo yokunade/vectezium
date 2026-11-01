@@ -100,6 +100,53 @@ async fn azure_blob_retried_upload_of_a_landed_blob_succeeds() {
 }
 
 #[tokio::test]
+async fn azure_blob_overwrite_order_by_never_replaces_a_newer_blob() {
+    let config = AzureBlobSinkConfig::new_emulator().await;
+    let client = config.build_test_client();
+    let blob = client.blob_client(&format!("latest/{}.json", random_string(10)));
+    let order_by: Vec<String> = vec!["seq".into(), "at".into()];
+    let upload = |seq: u64, at: u64| {
+        super::service::upload_unless_older(
+            &blob,
+            &order_by,
+            bytes::Bytes::from(format!("{{\"seq\":{seq},\"at\":{at}}}\n")),
+            "application/json",
+            None,
+            None,
+            None,
+        )
+    };
+    let stored = || async {
+        let bytes = blob
+            .download(None)
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+
+    upload(2, 1).await.expect("creates the blob");
+    // An older request that lands late (a retry, or a slow concurrent one) is skipped.
+    upload(1, 9).await.expect("an older blob is not an error");
+    assert_eq!(stored().await["seq"], 2);
+    // Later at the same `seq`, and newer: written.
+    upload(2, 2).await.unwrap();
+    assert_eq!(stored().await["at"], 2);
+    upload(3, 0).await.unwrap();
+    assert_eq!(stored().await["seq"], 3);
+
+    // Concurrent uploads in any order: the newest wins.
+    let uploads = (4..=12).rev().map(|seq| upload(seq, 0));
+    for result in futures::future::join_all(uploads).await {
+        result.expect("every upload succeeds or is skipped");
+    }
+    assert_eq!(stored().await["seq"], 12);
+}
+
+#[tokio::test]
 async fn azure_blob_uploads_multipart_with_shared_key() {
     let config = AzureBlobSinkConfig::new_emulator().await;
     let client = config.build_test_client();
@@ -291,6 +338,7 @@ async fn assert_rotate_files_after_the_buffer_size_is_reached(mut config: AzureB
         blob_append_uuid: Some(false),
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         batch: config.batch,
         ..config
     };
@@ -381,6 +429,7 @@ async fn assert_append_blob_reuses_same_blob(config: AzureBlobSinkConfig) {
         blob_append_uuid: Some(false),
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         ..config
     };
 
@@ -420,6 +469,7 @@ async fn assert_append_blob_json_encoding(config: AzureBlobSinkConfig) {
         blob_append_uuid: Some(false),
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         encoding: (
             Some(NewlineDelimitedEncoderConfig::new()),
             JsonSerializerConfig::default(),
@@ -468,6 +518,7 @@ async fn assert_append_blob_json_default_framing(config: AzureBlobSinkConfig) {
         blob_append_uuid: Some(false),
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         // Deliberately no framing: this is the config that array-framed each batch.
         encoding: (None::<FramingConfig>, JsonSerializerConfig::default()).into(),
         ..config
@@ -519,6 +570,7 @@ async fn assert_append_blob_default_hourly_rotation(config: AzureBlobSinkConfig)
         blob_append_uuid: None,
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         ..config
     };
 
@@ -600,6 +652,7 @@ async fn assert_append_blob_multiple_forced_flushes(config: AzureBlobSinkConfig)
         blob_append_uuid: Some(false),
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         batch,
         ..config
     };
@@ -647,6 +700,7 @@ async fn assert_append_blob_with_tags_and_metadata(config: AzureBlobSinkConfig) 
         blob_append_uuid: Some(false),
         blob_extension: None,
         blob_overwrite: false,
+        blob_overwrite_order_by: None,
         tags: Some(tags.clone()),
         metadata: Some(metadata.clone()),
         ..config
@@ -695,6 +749,7 @@ impl AzureBlobSinkConfig {
             blob_append_uuid: None,
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Block,
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
@@ -725,6 +780,7 @@ impl AzureBlobSinkConfig {
             blob_append_uuid: None,
             blob_extension: None,
             blob_overwrite: false,
+            blob_overwrite_order_by: None,
             blob_type: AzureBlobType::Block,
             encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             compression: Compression::None,
