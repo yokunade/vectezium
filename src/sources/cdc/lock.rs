@@ -427,13 +427,14 @@ impl Drop for HeldLock {
     }
 }
 
-/// How long a stopping source waits for its last offset write before releasing the lock.
-const LOCK_RELEASE_WAIT: Duration = Duration::from_secs(10);
+/// How long a stopping source waits for its last offset write (before releasing the lock).
+const LAST_WRITE_WAIT: Duration = Duration::from_secs(10);
 
 /// Runs a source under the single-writer lock (if configured): takes the lock before `run`
 /// starts (so before the stored offset is read), stops `run` if the lock is lost, and releases
 /// the lock once the last offset is written (`run` fires the `oneshot` sender after its last
-/// write; see `Checkpoints::start`).
+/// write; see `Checkpoints::start`). With or without the lock, the source ends only after that
+/// write, so a clean stop resumes from the last delivered offset.
 ///
 /// # Errors
 ///
@@ -448,8 +449,10 @@ where
     Fut: std::future::Future<Output = Result<(), String>>,
 {
     let Some(lock) = lock else {
-        let (done, _) = tokio::sync::oneshot::channel();
-        return run(WriterGuard::unlocked(), done).await;
+        let (done, written) = tokio::sync::oneshot::channel();
+        let result = run(WriterGuard::unlocked(), done).await;
+        _ = tokio::time::timeout(LAST_WRITE_WAIT, written).await;
+        return result;
     };
     let Some(held) = lock.acquire(shutdown).await? else {
         return Ok(());
@@ -461,7 +464,7 @@ where
                                  this server".to_owned()),
     };
     // Let the last acknowledged offset be stored, then release (which also fences writes).
-    _ = tokio::time::timeout(LOCK_RELEASE_WAIT, written).await;
+    _ = tokio::time::timeout(LAST_WRITE_WAIT, written).await;
     held.release().await;
     result
 }

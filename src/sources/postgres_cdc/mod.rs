@@ -40,6 +40,8 @@ mod connection;
 mod convert;
 mod envelope;
 mod incremental;
+#[cfg(all(test, feature = "postgres_cdc-integration-tests"))]
+mod integration_tests;
 mod offset;
 mod snapshot;
 mod source;

@@ -11,10 +11,10 @@ event formats, `seq`, control events, published offsets, snapshots, signals, the
 lock and offset recovery. Where they differ, the section says so. The connector-specific parts
 are [MySQL](#mysql) and [PostgreSQL](#postgresql).
 
-> **Status: tested locally.** Built on Vector v0.60.0. Unit tests pass in CI; `run-e2e.sh`
-> passes against MySQL 8.4 and Azurite; `postgres_cdc` has been tested end to end against
-> PostgreSQL 17 and Azurite, but has no test harness here yet. Not yet tested against Azure
-> Database for MySQL or PostgreSQL or real ADLS, or for long runs.
+> **Status: tested locally and in CI.** Built on Vector v0.60.0. Unit tests pass in CI, and so
+> do the `postgres_cdc` integration tests against PostgreSQL 13, 17 and 18 with Azurite;
+> `run-e2e.sh` passes against MySQL 8.4 and Azurite. Not yet tested against Azure Database for
+> MySQL or PostgreSQL or real ADLS, or for long runs.
 
 ## Build
 
@@ -38,6 +38,17 @@ Either source can be built alone (`sources-mysql_cdc` or `sources-postgres_cdc`)
 needs Rust (the version in `rust-toolchain.toml`), `protoc`, `clang` and `cmake`; see
 `docs/DEVELOPING.md`. CI (`.github/workflows/vectezium.yml`) also runs `cargo fmt --check` and
 clippy with `-D warnings`.
+
+The `postgres_cdc` integration tests run against a real PostgreSQL and Azurite, from
+`tests/integration/cdc/compose.yaml` (`PG_VERSION` picks the version, default 17). Each test
+uses its own database and slot; recreate the servers (`down -v`) between local runs, as every
+run leaves its slots behind. CI runs them on PostgreSQL 13, 17 and 18
+(`.github/workflows/vectezium-integration.yml`).
+
+```bash
+docker compose -f tests/integration/cdc/compose.yaml up -d --wait
+cargo test --locked --lib --no-default-features --features postgres_cdc-integration-tests --   sources::postgres_cdc::integration_tests
+```
 
 The `azure_blob` integration tests, including the ones for the options Vectezium adds, run
 against Azurite:
@@ -679,6 +690,8 @@ late request never replaces a newer offset. Needs `blob_overwrite: true`, `blob_
   **at-least-once**, like Debezium. Replayed changes carry the same `seq` as their first
   delivery; snapshot reads may not. See [Duplicates](#duplicates) for what to deduplicate on.
 * With `publish_offsets`, the published offset marks the delivered, transaction-complete prefix.
+* A source that stops cleanly waits (up to 10 s) for its last acknowledged offset to be
+  stored, so the next start resumes from it.
 * **PostgreSQL:** the slot is told it may release WAL only up to an offset that is stored (with
   `publish_offsets`: published and delivered), so a published offset is never behind what the
   slot still holds. At start, an offset older than the slot's position is treated as lost
