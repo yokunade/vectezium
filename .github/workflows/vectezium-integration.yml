@@ -1,5 +1,5 @@
 # Vectezium integration tests: the CDC sources against real servers
-# (tests/integration/cdc/compose.yaml), on each PostgreSQL version the source supports. Runs on
+# (tests/integration/cdc/compose.yaml), on the PostgreSQL and MySQL versions they support. Runs on
 # every push to the vectezium branch, and on pull requests that touch the CDC code.
 name: Vectezium integration
 
@@ -53,10 +53,10 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: cdc-integration
+          shared-key: cdc-integration-postgres
           save-if: ${{ matrix.postgres == '17' }}
       - name: Start PostgreSQL and Azurite
-        run: docker compose -f tests/integration/cdc/compose.yaml up -d --wait
+        run: docker compose -f tests/integration/cdc/compose.yaml up -d --wait postgres azurite
       - name: Clippy
         if: matrix.postgres == '17'
         run: cargo clippy --locked --lib --tests --no-default-features --features postgres_cdc-integration-tests -- -D warnings
@@ -64,6 +64,40 @@ jobs:
         run: >
           cargo test --locked --lib --no-default-features --features postgres_cdc-integration-tests --
           sources::postgres_cdc::integration_tests
+      - name: Server logs
+        if: failure()
+        run: docker compose -f tests/integration/cdc/compose.yaml logs --tail 200
+
+  mysql:
+    name: MySQL ${{ matrix.mysql }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported version and the current LTS (the demo's).
+        mysql: ["8.0", "8.4"]
+    env:
+      MYSQL_VERSION: ${{ matrix.mysql }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang cmake libclang-dev protobuf-compiler
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: cdc-integration-mysql
+          save-if: ${{ matrix.mysql == '8.4' }}
+      - name: Start MySQL and Azurite
+        run: docker compose -f tests/integration/cdc/compose.yaml up -d --wait mysql azurite
+      - name: Clippy
+        if: matrix.mysql == '8.4'
+        run: cargo clippy --locked --lib --tests --no-default-features --features mysql_cdc-integration-tests -- -D warnings
+      - name: Integration tests
+        run: >
+          cargo test --locked --lib --no-default-features --features mysql_cdc-integration-tests --
+          sources::mysql_cdc::integration_tests
       - name: Server logs
         if: failure()
         run: docker compose -f tests/integration/cdc/compose.yaml logs --tail 200

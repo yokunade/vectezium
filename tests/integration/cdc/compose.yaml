@@ -1,12 +1,17 @@
-# Servers for the CDC integration tests (the `postgres_cdc-integration-tests` feature):
+# Servers for the CDC integration tests (the `postgres_cdc-integration-tests` and
+# `mysql_cdc-integration-tests` features):
 #
 #   docker compose -f tests/integration/cdc/compose.yaml up -d --wait
 #   cargo test --lib --no-default-features --features postgres_cdc-integration-tests -- \
 #     sources::postgres_cdc::integration_tests
+#   cargo test --lib --no-default-features --features mysql_cdc-integration-tests -- \
+#     sources::mysql_cdc::integration_tests
 #
-# PG_VERSION picks the PostgreSQL image (default 17); PG_PORT and AZURITE_PORT the host ports.
-# The tests read PG_CDC_HOST, PG_CDC_PORT and AZURITE_ADDRESS (default: localhost, 5432).
-# Every test creates its own database and slot, so tests run in parallel against one server.
+# PG_VERSION and MYSQL_VERSION pick the images (default 17 and 8.4); PG_PORT, MYSQL_PORT and
+# AZURITE_PORT the host ports. The tests read PG_CDC_HOST, PG_CDC_PORT, MYSQL_CDC_HOST,
+# MYSQL_CDC_PORT and AZURITE_ADDRESS (default: localhost, 5432, localhost, 3306, localhost).
+# Every test creates its own database (and slot, or replica server ID), so tests run in parallel
+# against one server. Recreate the servers (`down -v`) between local runs.
 name: vectezium-cdc-it
 
 services:
@@ -33,6 +38,28 @@ services:
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
       interval: 1s
+      retries: 60
+
+  # Configured like a production CDC source: ROW events, FULL images and metadata, GTIDs.
+  mysql:
+    image: mysql:${MYSQL_VERSION:-8.4}
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --binlog-row-metadata=FULL
+      - --binlog-rows-query-log-events=ON
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --max-connections=500
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 2s
       retries: 60
 
   azurite:

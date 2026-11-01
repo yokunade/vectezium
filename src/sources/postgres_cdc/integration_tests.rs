@@ -5,47 +5,18 @@
 //! A test that names a pull request fails on the code before that pull request's fix.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    pin::Pin,
     time::Duration,
 };
 
-use azure_core::http::{RequestContent, StatusCode};
-use futures::{Stream, StreamExt, stream};
+use futures::StreamExt;
 use pgrepl_tokio_postgres::{Client, NoTls};
 use serde_json::{Value as Json, json};
-use tokio::{
-    sync::mpsc,
-    task::JoinHandle,
-    time::{Instant, sleep, timeout},
-};
-use vector_lib::event::EventContainer;
+use tokio::time::{sleep, timeout};
 
 use super::PostgresCdcConfig;
-use crate::{
-    SourceSender,
-    config::{ComponentKey, ProxyConfig, SourceConfig, SourceContext},
-    event::{Event, EventStatus},
-    shutdown::SourceShutdownCoordinator,
-    sources::cdc::{
-        CONTROL_OUTPUT, OFFSETS_OUTPUT,
-        lock::{LockClient, SingleWriterLockConfig},
-    },
-    test_util::{random_string, temp_dir, trace_init},
-};
-
-/// How long to wait for anything the source should do.
-const WAIT: Duration = Duration::from_mins(1);
-
-/// The container the lock and recovery tests use.
-const CONTAINER: &str = "cdc-it";
-
-type Events = Pin<Box<dyn Stream<Item = Event> + Send>>;
-
-fn env(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_owned())
-}
+use crate::{sources::cdc::integration_test_util::*, test_util::random_string};
 
 fn pg_host() -> String {
     env("PG_CDC_HOST", "localhost")
@@ -53,13 +24,6 @@ fn pg_host() -> String {
 
 fn pg_port() -> String {
     env("PG_CDC_PORT", "5432")
-}
-
-fn azurite_connection_string() -> String {
-    let address = env("AZURITE_ADDRESS", "localhost");
-    format!(
-        "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://{address}:10000/devstoreaccount1;"
-    )
 }
 
 async fn connect(database: &str) -> Client {
@@ -187,218 +151,10 @@ impl Db {
         );
         serde_yaml::from_str(&yaml).unwrap_or_else(|error| panic!("{error}:\n{yaml}"))
     }
-
-    /// The single-writer lock on this database's lock blob, as YAML fields.
-    fn lock_fields(&self) -> String {
-        format!(
-            "connection_string: \"{}\"\ncontainer_name: {CONTAINER}\nblob_name: {}/_lock\n\
-             lease_duration_secs: 15\n",
-            azurite_connection_string(),
-            self.name
-        )
-    }
-
-    fn lock(&self) -> LockClient {
-        let config: SingleWriterLockConfig = serde_yaml::from_str(&self.lock_fields()).unwrap();
-        config.build(&ProxyConfig::default()).unwrap()
-    }
-
-    /// `single_writer_lock` for the source's config, once the container exists.
-    async fn lock_yaml(&self) -> String {
-        if let Err(error) = self.lock().container().create(None).await {
-            assert_eq!(
-                error.http_status(),
-                Some(StatusCode::Conflict),
-                "failed to create the container: {error}"
-            );
-        }
-        let fields = self.lock_fields().trim_end().replace('\n', "\n  ");
-        format!("single_writer_lock:\n  {fields}\n")
-    }
-}
-
-fn new_dir() -> PathBuf {
-    let dir = temp_dir();
-    std::fs::create_dir_all(&dir).expect("failed to create a temporary directory");
-    dir
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
-    }
-}
-
-/// A running source. Row events and published offsets are acknowledged as the test reads them,
-/// so a stream the test does not read is a stalled sink. Control events take part in
-/// checkpoints too, so they are always read, into `control`.
-struct Running {
-    events: Events,
-    control: mpsc::UnboundedReceiver<Json>,
-    offsets: Option<Events>,
-    shutdown: SourceShutdownCoordinator,
-    /// Whether the source ended without an error.
-    task: JoinHandle<bool>,
-}
-
-fn named_output(out: &mut SourceSender, name: &str) -> Events {
-    Box::pin(
-        out.add_outputs(EventStatus::Delivered, name.to_owned())
-            .flat_map(|item| stream::iter(item.events.into_events())),
-    )
-}
-
-fn to_json(event: &Event) -> Json {
-    serde_json::to_value(event.as_log()).expect("an event that serializes")
 }
 
 async fn start(config: &PostgresCdcConfig) -> Running {
-    trace_init();
-    let (mut out, events) = SourceSender::new_test_finalize(EventStatus::Delivered);
-    let mut control_events = named_output(&mut out, CONTROL_OUTPUT);
-    let (control_tx, control) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(event) = control_events.next().await {
-            _ = control_tx.send(to_json(&event));
-        }
-    });
-    let offsets = config
-        .publish_offsets
-        .then(|| named_output(&mut out, OFFSETS_OUTPUT));
-    let (mut cx, shutdown) = SourceContext::new_shutdown(&ComponentKey::from("postgres"), out);
-    cx.acknowledgements = true;
-    let source = config.build(cx).await.expect("failed to build the source");
-    Running {
-        events: Box::pin(events),
-        control,
-        offsets,
-        shutdown,
-        task: tokio::spawn(async move { source.await.is_ok() }),
-    }
-}
-
-async fn next(events: &mut Events, what: &str) -> Json {
-    let event = timeout(WAIT, events.next())
-        .await
-        .unwrap_or_else(|_| panic!("no {what} within {WAIT:?}"))
-        .unwrap_or_else(|| panic!("the {what} stream ended"));
-    to_json(&event)
-}
-
-impl Running {
-    async fn rows(&mut self, n: usize) -> Vec<Json> {
-        let mut rows = Vec::with_capacity(n);
-        for _ in 0..n {
-            rows.push(next(&mut self.events, "row event").await);
-        }
-        rows
-    }
-
-    /// The next `control` event of type `kind`, skipping others.
-    async fn control_event(&mut self, kind: &str) -> Json {
-        loop {
-            let event = timeout(WAIT, self.control.recv())
-                .await
-                .unwrap_or_else(|_| panic!("no {kind} event within {WAIT:?}"))
-                .expect("the control stream ended");
-            if event["type"] == kind {
-                return event;
-            }
-        }
-    }
-
-    async fn no_rows_for(&mut self, period: Duration) {
-        if let Ok(Some(event)) = timeout(period, self.events.next()).await {
-            panic!("unexpected row event: {event:?}");
-        }
-    }
-
-    /// Shuts the source down cleanly; whether it ended without an error.
-    async fn stop(self) -> bool {
-        self.shutdown
-            .shutdown_all(Some(Instant::now() + Duration::from_secs(30)))
-            .await;
-        timeout(WAIT, self.task)
-            .await
-            .expect("the source did not stop")
-            .expect("the source panicked")
-    }
-
-    /// Waits for the source to end on its own; whether it ended without an error.
-    async fn exit(self) -> bool {
-        timeout(WAIT, self.task)
-            .await
-            .expect("the source kept running")
-            .expect("the source panicked")
-    }
-
-    /// Ends the source as a crash would: nothing more is stored.
-    fn kill(self) {
-        self.task.abort();
-    }
-}
-
-fn op(event: &Json) -> &str {
-    event["metadata"]["op"].as_str().expect("metadata.op")
-}
-
-fn seq(event: &Json) -> &str {
-    event["metadata"]["seq"].as_str().expect("metadata.seq")
-}
-
-fn after(event: &Json) -> &Json {
-    &event["record"]["after"]
-}
-
-fn before(event: &Json) -> &Json {
-    &event["record"]["before"]
-}
-
-fn id(event: &Json) -> i64 {
-    after(event)["id"].as_i64().expect("record.after.id")
-}
-
-fn ids(events: &[Json]) -> Vec<i64> {
-    let mut ids: Vec<i64> = events.iter().map(id).collect();
-    ids.sort_unstable();
-    ids
-}
-
-fn columns(event: &Json) -> BTreeSet<String> {
-    after(event)
-        .as_object()
-        .expect("record.after")
-        .keys()
-        .cloned()
-        .collect()
-}
-
-/// Writes a signal to `<folder>/pending/`, under another name first so it appears whole.
-fn write_signal(folder: &Path, name: &str, signal: &Json) {
-    let pending = folder.join("pending");
-    std::fs::create_dir_all(&pending).unwrap();
-    let tmp = pending.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, signal.to_string()).unwrap();
-    std::fs::rename(tmp, pending.join(format!("{name}.json"))).unwrap();
-}
-
-async fn wait_until<F, Fut>(what: &str, mut condition: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = bool>,
-{
-    let deadline = Instant::now() + WAIT;
-    while !condition().await {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        sleep(Duration::from_millis(250)).await;
-    }
+    start_source(config, config.publish_offsets, false).await
 }
 
 const TABLE: &str =
@@ -879,13 +635,7 @@ async fn signal_snapshots_a_table_while_running() {
     );
     assert_eq!(ids(&rows), [1, 2]);
 
-    let processed = signals.join("processed");
-    let result = std::fs::read_dir(&processed)
-        .unwrap()
-        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-        .map(|text| serde_json::from_str::<Json>(&text).unwrap())
-        .find(|signal| signal["id"] == "s1")
-        .expect("the signal is not in processed/");
+    let result = processed_signal(&signals, "s1");
     assert_eq!(result["result"]["status"], "applied");
     assert!(source.stop().await);
 }
@@ -920,34 +670,15 @@ async fn replica_identity_decides_the_images() {
     assert!(source.stop().await);
 }
 
-/// Uploads `offset` as the published latest offset, as the `azure_blob` sink of the example
-/// configs would.
-async fn publish_latest(db: &Db, offset: &Json) {
-    let container = db.lock().container();
-    let mut offset = offset.clone();
-    let object = offset.as_object_mut().unwrap();
-    object.remove("source_type");
-    object.remove("timestamp");
-    container
-        .blob_client(&format!("{}/_offsets/latest.json", db.name))
-        .upload(
-            RequestContent::from(format!("{offset}\n").into_bytes()),
-            None,
-        )
-        .await
-        .expect("failed to upload latest.json");
-}
-
 /// A source that lost its data directory resumes from the published offset: the same
 /// position, `seq` numbering and table-snapshot state, so nothing is snapshotted again.
 #[tokio::test]
 async fn recovers_from_the_published_offset() {
     let db = Db::new(&format!("{TABLE} INSERT INTO t VALUES (1, 'a');")).await;
     let config = db.config(&format!(
-        "publish_offsets: true\n{}offset_recovery:\n  latest_blob: {db}/_offsets/latest.json\n  \
-         folder: {db}/\n",
-        db.lock_yaml().await,
-        db = db.name
+        "{}{}",
+        lock_yaml(&db.name).await,
+        recovery_yaml(&db.name)
     ));
 
     let mut source = start(&config).await;
@@ -955,15 +686,10 @@ async fn recovers_from_the_published_offset() {
     db.exec("INSERT INTO t VALUES (2, 'b')").await;
     let change = source.rows(1).await;
     let mut offsets = source.offsets.take().unwrap();
-    let mut latest = Json::Null;
-    while latest.get("seq").and_then(Json::as_str) < Some(seq(&change[0])) {
-        latest = next(&mut offsets, "published offset").await;
-    }
+    let latest = latest_offset(&mut offsets, seq(&change[0])).await;
     assert!(source.stop().await);
-    while let Ok(Some(event)) = timeout(Duration::from_secs(2), offsets.next()).await {
-        latest = to_json(&event);
-    }
-    publish_latest(&db, &latest).await;
+    let latest = drain_offsets(&mut offsets, latest).await;
+    publish_latest(&db.name, &latest).await;
 
     std::fs::remove_dir_all(&db.data_dir).unwrap();
     std::fs::create_dir_all(&db.data_dir).unwrap();
@@ -981,7 +707,7 @@ async fn recovers_from_the_published_offset() {
 #[tokio::test]
 async fn second_instance_waits_for_the_lock() {
     let db = Db::new(&format!("{TABLE} INSERT INTO t VALUES (1, 'a');")).await;
-    let config = db.config(&db.lock_yaml().await);
+    let config = db.config(&lock_yaml(&db.name).await);
 
     let mut first = start(&config).await;
     first.rows(1).await;
