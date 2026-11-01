@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -27,6 +30,8 @@ pub struct AzureBlobRequestOptions {
     pub blob_extension: Option<String>,
     /// Replace existing block blobs instead of failing.
     pub blob_overwrite: bool,
+    /// Replace them only if the new blob does not order before them by these JSON fields.
+    pub blob_overwrite_order_by: Option<Arc<[String]>>,
     pub blob_type: AzureBlobType,
     pub encoder: (Transformer, Encoder<Framer>),
     pub compression: Compression,
@@ -115,6 +120,7 @@ impl RequestBuilder<(String, Vec<Event>)> for AzureBlobRequestOptions {
             blob_metadata: self.metadata.as_ref().filter(|m| !m.is_empty()).cloned(),
             blob_type: self.blob_type,
             overwrite: self.blob_overwrite,
+            overwrite_order_by: self.blob_overwrite_order_by.clone(),
         }
     }
 }

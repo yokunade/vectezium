@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     result::Result as StdResult,
     sync::Arc,
     task::{Context, Poll},
@@ -14,6 +15,7 @@ use azure_storage_blob::{
 };
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use serde_json::Value as Json;
 use tower::Service;
 use tracing::Instrument;
 
@@ -52,8 +54,21 @@ impl Service<AzureBlobRequest> for AzureBlobService {
                 .blob_client(request.metadata.partition_key.as_str());
             let byte_size = request.blob_data.len();
 
-            let result = match request.blob_type {
-                AzureBlobType::Block => {
+            let order_by = request.overwrite_order_by.clone();
+            let result = match (request.blob_type, order_by.as_deref()) {
+                (AzureBlobType::Block, Some(order_by)) => {
+                    upload_unless_older(
+                        &blob_client,
+                        order_by,
+                        request.blob_data,
+                        request.content_type,
+                        request.content_encoding,
+                        request.tags,
+                        request.blob_metadata,
+                    )
+                    .await
+                }
+                (AzureBlobType::Block, None) => {
                     upload_block_blob(
                         &blob_client,
                         request.overwrite,
@@ -65,7 +80,7 @@ impl Service<AzureBlobRequest> for AzureBlobService {
                     )
                     .await
                 }
-                AzureBlobType::Append => {
+                (AzureBlobType::Append, _) => {
                     append_blob(
                         &blob_client.append_blob_client(),
                         request.blob_data,
@@ -130,6 +145,118 @@ pub(super) async fn upload_block_blob(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// How often [`upload_unless_older`] reads the blob again after another writer changed it.
+const CONDITIONAL_ATTEMPTS: usize = 5;
+
+/// Uploads `data` (a JSON object) unless the existing blob orders after it by the `order_by`
+/// fields. The upload is conditional on the `ETag` of the blob that was compared (or on there
+/// being none), so a concurrent write in between makes it compare again instead of replacing a
+/// newer blob.
+pub(super) async fn upload_unless_older(
+    blob_client: &BlobClient,
+    order_by: &[String],
+    data: Bytes,
+    content_type: &'static str,
+    content_encoding: Option<&'static str>,
+    tags: Option<String>,
+    blob_metadata: Option<std::collections::HashMap<String, String>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let new = order_key(&data, order_by).ok_or_else(|| {
+        format!(
+            "`blob_overwrite_order_by`: the blob is not one JSON object (set `batch.max_events: 1` \
+             and a `json` codec) with the fields {order_by:?}"
+        )
+    })?;
+    for _ in 0..CONDITIONAL_ATTEMPTS {
+        let mut options = BlockBlobClientUploadOptions {
+            blob_content_type: Some(content_type.to_string()),
+            blob_content_encoding: content_encoding.map(str::to_string),
+            blob_tags_string: tags.clone(),
+            metadata: blob_metadata.clone(),
+            ..Default::default()
+        };
+        match blob_client.download(None).await {
+            Ok(existing) => {
+                let etag = existing
+                    .properties
+                    .etag
+                    .clone()
+                    .ok_or("the existing blob has no ETag")?;
+                let bytes = existing.body.collect().await?;
+                // An existing blob that is not a JSON object with the fields is replaced.
+                if let Some(old) = order_key(&bytes, order_by)
+                    && compare(&new, &old) == Ordering::Less
+                {
+                    debug!(message = "Not replacing a blob that orders after this one.");
+                    return Ok(());
+                }
+                options.if_match = Some(etag);
+            }
+            Err(error) if error.http_status() == Some(StatusCode::NotFound) => {
+                options = options.if_not_exists();
+            }
+            Err(error) => return Err(error.into()),
+        }
+        match blob_client
+            .upload(RequestContent::from(data.to_vec()), Some(options))
+            .instrument(info_span!("request").or_current())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // Written meanwhile by another request: compare again.
+            Err(error)
+                if matches!(
+                    error.http_status(),
+                    Some(StatusCode::PreconditionFailed | StatusCode::Conflict)
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(
+        format!("the blob kept changing while it was compared ({CONDITIONAL_ATTEMPTS} attempts)")
+            .into(),
+    )
+}
+
+/// The values of a JSON object's `fields`, for ordering; `None` if `bytes` is not one JSON
+/// object.
+fn order_key(bytes: &[u8], fields: &[String]) -> Option<Vec<Json>> {
+    let Json::Object(object) = serde_json::from_slice::<Json>(bytes).ok()? else {
+        return None;
+    };
+    Some(
+        fields
+            .iter()
+            .map(|field| object.get(field).cloned().unwrap_or(Json::Null))
+            .collect(),
+    )
+}
+
+/// Compares order keys field by field: a missing field (or null) first, then numbers (as
+/// numbers), then strings (as text); other values are equal to each other.
+fn compare(a: &[Json], b: &[Json]) -> Ordering {
+    const fn rank(value: &Json) -> u8 {
+        match value {
+            Json::Null => 0,
+            Json::Number(_) => 1,
+            Json::String(_) => 2,
+            _ => 3,
+        }
+    }
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| match (a, b) {
+            (Json::Number(a), Json::Number(b)) => a
+                .as_f64()
+                .partial_cmp(&b.as_f64())
+                .unwrap_or(Ordering::Equal),
+            (Json::String(a), Json::String(b)) => a.cmp(b),
+            _ => rank(a).cmp(&rank(b)),
+        })
+        .find(|ordering| ordering.is_ne())
+        .unwrap_or(Ordering::Equal)
 }
 
 /// Whether the existing blob holds exactly `data`. A blob with other content (a genuine name
@@ -232,4 +359,39 @@ async fn append_blob(
         .await
         .map(|_| ())
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn key(value: &Json) -> Vec<Json> {
+        order_key(value.to_string().as_bytes(), &["seq".into(), "at".into()]).unwrap()
+    }
+
+    #[test]
+    fn orders_blobs_by_their_fields() {
+        let older = key(&json!({"seq": "0002.0000", "at": "2026-01-01T00:00:01.000Z"}));
+        let later_same_seq = key(&json!({"seq": "0002.0000", "at": "2026-01-01T00:00:02.000Z"}));
+        let newer = key(&json!({"seq": "0010.0000", "at": "2026-01-01T00:00:00.000Z"}));
+        assert_eq!(compare(&older, &later_same_seq), Ordering::Less);
+        assert_eq!(compare(&newer, &later_same_seq), Ordering::Greater);
+        assert_eq!(compare(&older, &older), Ordering::Equal);
+        // Numbers compare as numbers, not as text.
+        assert_eq!(
+            compare(&key(&json!({"seq": 9})), &key(&json!({"seq": 10}))),
+            Ordering::Less
+        );
+        // A missing field orders first.
+        assert_eq!(
+            compare(&key(&json!({"at": "x"})), &key(&json!({"seq": 1}))),
+            Ordering::Less
+        );
+        // One JSON object per blob (a trailing newline is fine), nothing else.
+        assert!(order_key(b"{\"seq\": 1}\n", &["seq".into()]).is_some());
+        assert!(order_key(b"{\"seq\": 1}\n{\"seq\": 2}\n", &["seq".into()]).is_none());
+        assert!(order_key(b"[1]", &["seq".into()]).is_none());
+    }
 }
