@@ -1,35 +1,53 @@
-# `mysql_cdc` source for Vector
+# Vectezium CDC sources: `mysql_cdc` and `postgres_cdc`
 
-A Vector source that does what Debezium Server's MySQL connector does — consistent snapshot,
-then binlog streaming, emitting Debezium-format change events — inside a single Vector binary.
-Everything Vector can do with events (VRL transforms, routing, disk buffers, the `azure_blob`
-sink for ADLS Gen2, S3, Kafka, …) applies directly.
+Two Vector sources that do what Debezium Server's MySQL and PostgreSQL connectors do (a
+consistent snapshot, then streaming changes from the MySQL binlog or a PostgreSQL logical
+replication slot, as Debezium-format change events) inside a single Vector binary. Everything
+Vector can do with events (VRL transforms, routing, disk buffers, the `azure_blob` sink for ADLS
+Gen2, S3, Kafka, …) applies directly.
 
-> **Status: tested locally.** Compiles warning-free against Vector v0.60.0 (`mysql_async` 0.37.1),
-> unit tests pass, and `run-e2e.sh` passes against MySQL 8.4 and Azurite.
-> Not yet tested against Azure Database for MySQL or real ADLS, under load, or for long runs.
+Both connectors share one core (`src/sources/cdc/`), so most of this document applies to both:
+event formats, `seq`, control events, published offsets, snapshots, signals, the single-writer
+lock and offset recovery. Where they differ, the section says so. The connector-specific parts
+are [MySQL](#mysql) and [PostgreSQL](#postgresql).
+
+> **Status: tested locally.** Built on Vector v0.60.0. Unit tests pass in CI; `run-e2e.sh`
+> passes against MySQL 8.4 and Azurite; `postgres_cdc` has been tested end to end against
+> PostgreSQL 17 and Azurite, but has no test harness here yet. Not yet tested against Azure
+> Database for MySQL or PostgreSQL or real ADLS, or for long runs.
 
 ## Build
 
-The patch applies to Vector **v0.60.0**.
+Vectezium is a fork of Vector v0.60.0 (`vectezium` branch of
+[yokunade/Vectezium](https://github.com/yokunade/Vectezium)).
 
 ```bash
-git clone https://github.com/vectordotdev/vector.git && cd vector
-git checkout v0.60.0
-git am /path/to/mysql_cdc.patch          # or: git apply mysql_cdc.patch
+git clone -b vectezium https://github.com/yokunade/Vectezium.git && cd Vectezium
 
-# Small binary with just what the pipeline needs (Cargo.lock is updated automatically):
-cargo build --release --no-default-features \
-  --features "sources-mysql_cdc,transforms-remap,sinks-azure_blob,sinks-file,sinks-console"
+# Small binary with just what the pipeline needs (add transforms-remap etc. for VRL):
+cargo build --release --locked --no-default-features \
+  --features "sources-mysql_cdc,sources-postgres_cdc,sinks-azure_blob,sinks-file"
 
-# Unit tests for the new code:
-cargo test --no-default-features --features sources-mysql_cdc mysql_cdc
+# Unit tests for the CDC code, as CI runs them:
+cargo test --locked --lib --no-default-features \
+  --features "sources-mysql_cdc,sources-postgres_cdc,sinks-azure_blob" -- \
+  sources::cdc sources::mysql_cdc sources::postgres_cdc sinks::azure_blob
 ```
 
-Building Vector needs Rust (see `rust-toolchain.toml`), `protoc`, and a C toolchain; see
-`docs/DEVELOPING.md` in the Vector repository.
+Either source can be built alone (`sources-mysql_cdc` or `sources-postgres_cdc`). Building Vector
+needs Rust (the version in `rust-toolchain.toml`), `protoc`, `clang` and `cmake`; see
+`docs/DEVELOPING.md`. CI (`.github/workflows/vectezium.yml`) also runs `cargo fmt --check` and
+clippy with `-D warnings`.
 
-## Test end to end (Docker)
+The `azure_blob` integration tests, including the ones for the options Vectezium adds, run
+against Azurite:
+
+```bash
+AZURITE_ADDRESS=localhost cargo test --locked --lib --no-default-features \
+  --features azure-blob-integration-tests -- sinks::azure_blob::integration_tests
+```
+
+## Test end to end (Docker, MySQL)
 
 ```bash
 cd contrib/mysql_cdc
@@ -41,7 +59,7 @@ This starts MySQL 8.4 (configured for CDC) and Azurite (a local Blob/ADLS emulat
 changes, rolled-back transactions, DDL, filters, restart/resume, the single-writer lock, and the gzip NDJSON blobs written
 to Azurite. Requires Docker and `jq`.
 
-## Load test (Docker)
+## Load test (Docker, MySQL)
 
 ```bash
 cd contrib/mysql_cdc
@@ -57,17 +75,24 @@ throughput, and Vector's memory and CPU use (`out/load-report.json`). Requires D
 
 ## Parallel snapshots
 
-`snapshot_max_threads` (default `1`) reads tables on that many connections at once. All of them
-start their consistent-snapshot transaction while the global read lock is held, so they see the
-database at the same instant and the result is identical to a single-threaded snapshot. Tables
-with a single-column integer primary key are split into primary-key ranges of about
-`snapshot_chunk_size` rows (default 1,000,000; `0` disables chunking), so one large table is
-also spread across the threads. Event building happens on the reader threads; Debezium's
-first/last snapshot markers are preserved.
+`snapshot_max_threads` (default `1`) reads tables on that many connections at once, and the
+result is identical to a single-threaded snapshot:
 
-Each thread is a long-running read transaction on MySQL; consider snapshotting from a replica.
+* **MySQL:** every reader starts its consistent-snapshot transaction while the global read lock
+  is held, so they all see the database at the same instant. Tables with a single-column integer
+  primary key are split into primary-key ranges of about `snapshot_chunk_size` rows (default
+  1,000,000; `0` disables chunking), so one large table is also spread across the threads.
+* **PostgreSQL:** every reader imports the snapshot the replication slot exported when it was
+  created, so the snapshot ends exactly where streaming starts. Each table is read through a
+  server-side cursor, `snapshot_fetch_size` rows (default 10,000) per round trip; tables are not
+  split.
 
-### Snapshot benchmark
+Event building happens on the reader threads; Debezium's first/last snapshot markers are
+preserved. Each reader is a long-running read transaction; on MySQL consider snapshotting from a
+replica, and on PostgreSQL note that it holds back `VACUUM` while it runs (or use
+`snapshot_strategy: incremental`).
+
+### Snapshot benchmark (MySQL)
 
 ```bash
 ./run-snapshot-bench.sh ../../target/release/vector 100000000 5 8   # 5 x 100M rows, 8 threads
@@ -79,7 +104,9 @@ Seeds the tables on the server (`INSERT … SELECT`, binlog off for the seed), t
 refuses to start if the run will not fit (about 560 bytes per row: ~490 in InnoDB, ~70 of
 gzip output).
 
-## Server requirements
+## MySQL
+
+### Server requirements
 
 MySQL 8.0 or newer with:
 
@@ -95,7 +122,7 @@ enforce_gtid_consistency = ON
 User privileges: `SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT`.
 The source checks these settings at start-up and fails with a clear message if one is wrong.
 
-## How it maps to Debezium
+### How it maps to Debezium
 
 | Debezium MySQL connector                  | `mysql_cdc`                                            |
 |-------------------------------------------|--------------------------------------------------------|
@@ -123,14 +150,97 @@ Each event body is the Debezium payload as the JSON converter emits it with
 `snapshot`, `db`, `table`, `server_id`, `gtid`, `file`, `pos`, `row`, `thread`, `query`, `seq`, …),
 `transaction`, `op` (`r`/`c`/`u`/`d`), `ts_ms`, `ts_us`, `ts_ns`. With Vector's default (legacy)
 log namespace, Vector also adds `source_type` and `timestamp` (the commit time) to each event.
-Value representations follow Debezium's defaults; see the table in `convert.rs`.
+Value representations follow Debezium's defaults; see the table in `mysql_cdc/convert.rs`.
+
+## PostgreSQL
+
+### Server requirements
+
+PostgreSQL 13 or newer with `wal_level = logical` (a restart is needed to change it), and room for
+one more replication slot and WAL sender (`max_replication_slots`, `max_wal_senders`). Set
+`max_slot_wal_keep_size` so a stopped source can't fill the disk with WAL; a slot that falls
+further behind is invalidated, and the source then re-snapshots (`snapshot_mode: when_needed`) or
+stops.
+
+The user needs the `REPLICATION` attribute and `SELECT` on the captured tables. To let the source
+create its publication (`publication_autocreate_mode`, below) it also needs `CREATE` on the
+database and ownership of the tables (`filtered`), or superuser (`all_tables`). The source checks
+the version, `wal_level` and the replication attribute at start-up and fails with a clear message
+if one is wrong.
+
+### Slot and publication
+
+One source captures one database through one logical replication slot (`slot_name`, default
+`vectezium`, using `pgoutput`) and one publication (`publication_name`, default `vectezium`).
+
+* **The slot** is created on the first start. It holds WAL until the source has stored (or
+  published and delivered) an offset past it, so offsets never get ahead of the lake. Give every
+  source on a database its own `slot_name`: the source only drops and re-creates an existing slot
+  (to snapshot again) when its own stored offset names that slot, or the slot was invalidated.
+  Finding a slot it has no offset for, it stops with an error instead of taking it over. If a
+  snapshot fails, the slot it created is dropped again.
+* **The publication** decides which tables are streamed; the include and exclude lists then
+  filter further. `publication_autocreate_mode`:
+
+  | Mode | |
+  |---|---|
+  | `filtered` (default) | Create it `FOR TABLE` the captured tables if it does not exist. Tables without a replica identity are left out, with a warning, because PostgreSQL rejects every `UPDATE` and `DELETE` on a published table that has none. |
+  | `all_tables` | Create it `FOR ALL TABLES`. Refused while any table lacks a replica identity. Tables created later are published too. |
+  | `disabled` | The publication must exist; the source never creates or changes it. |
+
+  Publications the source creates use `publish_via_partition_root = true`, so a partitioned
+  table's changes arrive as the table's, not its partitions'. For a publication you create
+  yourself, set it too; the source warns about captured partitioned tables otherwise. Tables
+  that match the include lists but are not in the publication are logged at start.
+* **Replica identity:** without `REPLICA IDENTITY FULL`, an update carries no before image, a
+  delete carries only the key, and a large (TOASTed) value the update did not change arrives as
+  `unavailable_value_placeholder` (default `__debezium_unavailable_value`, as in Debezium). The
+  source warns about such tables when the event format includes before images.
+* **Generated columns** are streamed only when the publication publishes them (PostgreSQL 18,
+  `publish_generated_columns = stored`); the snapshot includes them exactly when the stream
+  does, so both have the same columns.
+
+`status_update_interval_secs` (default 10) is how often the source reports its position to the
+server; keep it well below `wal_sender_timeout`.
+
+### How it maps to Debezium
+
+| Debezium PostgreSQL connector             | `postgres_cdc`                                         |
+|-------------------------------------------|--------------------------------------------------------|
+| `database.hostname/port/user/password/dbname` | `hostname`, `port`, `user`, `password`, `database` |
+| `topic.prefix`                            | `topic_prefix` (→ `source.name`)                       |
+| `slot.name`, `publication.name`           | `slot_name`, `publication_name`                        |
+| `publication.autocreate.mode`             | `publication_autocreate_mode` (`filtered` default, `all_tables`, `disabled`) |
+| `schema/table.include/exclude.list`       | `schema_include_list`, `table_include_list`, …         |
+| `column.exclude.list`                     | `column_exclude_list`                                  |
+| `message.key.columns`                     | `pk_override`                                          |
+| `snapshot.mode` initial / initial_only / no_data / when_needed | `snapshot_mode` (same values)     |
+| `decimal.handling.mode`                   | `decimal_handling_mode` (`precise` default, `string`, `double`; also `MONEY`) |
+| `binary.handling.mode`                    | `binary_handling_mode` (`base64`, `base64_url_safe`, `hex`) |
+| `time.precision.mode`                     | `time_precision_mode` (`adaptive_time_microseconds`, `connect`) |
+| `interval.handling.mode`                  | `interval_handling_mode` (`numeric`, `string`)         |
+| `money.fraction.digits`                   | `money_fraction_digits`                                |
+| `unavailable.value.placeholder`           | `unavailable_value_placeholder`                        |
+| `status.update.interval.ms`               | `status_update_interval_secs`                          |
+| `database.sslmode`, `database.sslrootcert` | `ssl_mode` (`verify_full` default), `ssl_ca_file`     |
+| `event.processing.failure.handling.mode`  | `event_processing_failure_handling_mode`               |
+| `ExtractNewRecordState` SMT (flattening)  | `event_format: record`, `record_images`                |
+| Offset store (file / Kafka)               | `offsets.json` in Vector's `data_dir`, written atomically |
+| Kafka message key                         | `%postgres_cdc.key` event metadata (key columns)       |
+
+The `source` block is Debezium's for PostgreSQL (`connector: "postgresql"`, `db`, `schema`,
+`table`, `txId`, `lsn`, `sequence`, …, plus `seq`); with `event_format: record`, `metadata` has
+`database`, `db` (the schema), `table`, `txid` and `lsn`. Value representations follow Debezium's
+defaults; see the table in `postgres_cdc/convert.rs`.
 
 ## Event formats
 
-`event_format: debezium` (default) emits Debezium's payload, as described above.
+`event_format: debezium` (default) emits Debezium's payload, as described in each connector's
+section.
 
 `event_format: record` emits one object per change with the row in `record` and everything
-about the change in `metadata`:
+about the change in `metadata` (a MySQL example; the position fields after `captured_ts_ms` are
+each connector's, see [PostgreSQL](#how-it-maps-to-debezium-1)):
 
 ```json
 {
@@ -173,16 +283,17 @@ Every event has **`seq`** (`metadata.seq`, or `source.seq` with `event_format: d
 master sequence per source, as a fixed-width string that sorts correctly as text:
 
 ```
-00000000000000009001.0000000000    binlog change 9001
+00000000000000009001.0000000000    change 9001
 00000000000000009001.0000000042    42nd snapshot row emitted after it
-00000000000000009002.0000000000    the next binlog change
+00000000000000009002.0000000000    the next change
 ```
 
-* The **first part** (20 digits) counts binlog-derived events: changes, `truncate` and
+* The **first part** (20 digits) counts events from the change stream (the binlog or the
+  WAL): changes, `truncate` and
   `schema_change`. Each advances it by one, and it is stored with the offset, so events replayed
   after a crash get the **same** `seq`: a repeated change is identical, `seq` included.
 * The **second part** (10 digits) positions snapshot-derived events (`r` rows and
-  `snapshot_completed`) after the latest binlog event, without advancing the counter, because
+  `snapshot_completed`) after the latest streamed event, without advancing the counter, because
   when a snapshot chunk is emitted differs between runs. So, unlike a change, a snapshot read
   does **not** keep its `seq` across a crash (see [Duplicates](#duplicates)).
 * Apply events in `seq` order (`AUTO CDC … SEQUENCE BY seq`); no other field is needed. For a
@@ -220,8 +331,8 @@ Events about a table or the connector, each with `seq` (in the same numbering as
 
 | `type` | When | Fields |
 |---|---|---|
-| `schema_change` | DDL on captured objects (`include_schema_changes`) | `db`, `ddl`, `kind`, `objects`, `data_changed`, `gtid`, `file`, `pos` |
-| `truncate` | `TRUNCATE TABLE` on a captured table (it has no row events) | `db`, `table`, `gtid`, `file`, `pos` |
+| `schema_change` | MySQL: DDL on captured objects. PostgreSQL: a captured table's columns changed (it streams no DDL). Both need `include_schema_changes`. | `db`, `kind`; MySQL: `ddl`, `objects`, `data_changed`, `gtid`, `file`, `pos`; PostgreSQL: `table`, `columns_added`, `columns_removed`, `columns_retyped`, `txid`, `lsn` |
+| `truncate` | `TRUNCATE TABLE` on a captured table (it has no row events) | `db`, `table`; MySQL: `gtid`, `file`, `pos`; PostgreSQL: `cascade`, `restart_identity`, `txid`, `lsn` |
 | `snapshot_completed` | The snapshot of a table is complete (`snapshot_end_markers`) | `db`, `table`, `snapshot_id`, `started_seq`, `rows` |
 | `snapshot_held` | At start, for each table whose unplanned snapshot is held (`unplanned_snapshots: hold`) | `db`, `table`, `reason` |
 
@@ -237,6 +348,11 @@ been delivered, the source publishes it (at most every `offset_publish_interval_
  "committed_at": "2026-10-26T09:40:12.418Z", "checkpoint": {…}}
 ```
 
+The position fields are the connector's: `gtid_set`, `file` and `pos` for MySQL, `lsn` and
+`slot_name` for PostgreSQL. PostgreSQL also publishes when its position moves without a new
+`seq` (the slot advancing past transactions on tables it does not capture), so the slot can
+release WAL.
+
 Every event with `seq` ≤ the published `seq` is delivered, and every transaction it belongs to
 is complete, across all tables. Published offsets are not acknowledged, so a slow offsets sink
 never holds back checkpoints. Requires end-to-end acknowledgements.
@@ -244,6 +360,12 @@ never holds back checkpoints. Requires end-to-end acknowledgements.
 `checkpoint` is the whole stored offset (what `offsets.json` holds: position, `seq` counters,
 snapshotted tables, incremental-snapshot progress, held tables), so a source that lost its data
 directory can resume from it (`offset_recovery`, below).
+
+The source keeps one published offset in flight at a time: the next one is published only after
+the last was delivered or failed. To keep the latest one in a single blob (`latest.json`), use
+an `azure_blob` sink with `batch.max_events: 1`, `blob_overwrite: true` and
+`blob_overwrite_order_by: ["seq", "committed_at"]`, so a request that times out and lands late
+can never replace a newer offset (see [`azure_blob` options](#azure_blob-sink-options)).
 
 ### Unacknowledged copies (`observe` output, `observe_output: true`)
 
@@ -275,8 +397,8 @@ a blocking buffer would still make the source wait to hand them over.
   `apply_as_truncates` for SCD type 1).
 * **`snapshot_completed`:** once you hold `rows` rows of the table with its `snapshot_id`, delete
   every key the snapshot did not contain whose last change has `seq < started_seq`. This removes
-  rows deleted while the binlog was unavailable (a re-snapshot after a purge produces no `d`
-  events for them). `started_seq` is exact; no clocks are involved.
+  rows deleted while the change stream was unavailable (a re-snapshot after a purged binlog or
+  a lost slot produces no `d` events for them). `started_seq` is exact; no clocks are involved.
 * **Whole transactions:** apply (or show) only rows with `seq ≤` the latest published offset. With
   an SCD type 2 target sequenced by `seq`, an "as of commit" view
   (`__START_AT <= c.seq AND (__END_AT IS NULL OR __END_AT > c.seq)`) is consistent across tables.
@@ -285,34 +407,40 @@ a blocking buffer would still make the source wait to hand them over.
 
 | Setting | Default | |
 |---|---|---|
-| `snapshot_strategy` | `blocking` | How the initial snapshot (and a re-snapshot after a purged binlog) reads tables. |
+| `snapshot_strategy` | `blocking` | How the initial snapshot (and a re-snapshot after a purged binlog or a lost slot) reads tables. |
 | `snapshot_new_tables` | `false` | Snapshot tables that become captured later. |
 | `incremental_snapshot_chunk_size` | `4096` | Rows per incremental chunk. |
-| `pk_override.<db>.<table>` | — | Key columns, e.g. `"call_ref, site"`. |
+| `pk_override.<db or schema>.<table>` | — | Key columns, e.g. `"call_ref, site"`. |
 
 **`blocking`** reads every table in one consistent snapshot before streaming starts (see
-*Parallel snapshots*). Its long transactions hold metadata locks: an `ALTER TABLE` on a table
-being read waits until the snapshot ends, and writes queue behind that `ALTER`.
+*Parallel snapshots*). Its long transactions hold table locks (MySQL metadata locks,
+PostgreSQL `ACCESS SHARE`): an `ALTER TABLE` on a table being read waits until the snapshot
+ends, and writes queue behind that `ALTER`.
 
 **`incremental`** starts streaming immediately and reads tables in key order, in chunks of
-`incremental_snapshot_chunk_size` rows, between binlog transactions. Each chunk is one short
-query bracketed by two reads of `@@GLOBAL.gtid_executed` (the read-only form of the DBLog
-watermark algorithm that Debezium also uses): a streamed change to one of the chunk's keys,
-from a transaction newer than the first read, replaces the chunk's copy, and the chunk is only
-emitted once the stream has passed the second read. Locks last one chunk; a snapshot row never
+`incremental_snapshot_chunk_size` rows, between streamed transactions, using the read-only form
+of the DBLog watermark algorithm that Debezium also uses. A streamed change to one of the
+chunk's keys, from a transaction the chunk could not see, replaces the chunk's copy, and the
+chunk is only emitted once the stream has passed every transaction it could see:
+
+* **MySQL:** each chunk is one short query bracketed by two reads of `@@GLOBAL.gtid_executed`.
+  Needs GTID mode.
+* **PostgreSQL:** each chunk is one short `REPEATABLE READ` transaction that also reads
+  `pg_current_snapshot()` (which transactions it sees) and then `pg_current_wal_insert_lsn()`
+  (how far the stream must get). Locks last one chunk; a snapshot row never
 overwrites a newer change. Progress (the last key delivered) is stored with the offset, so a
 restart resumes from the last delivered chunk. Rows have `metadata.snapshot: "incremental"`,
-and each table ends with a `snapshot_completed` control event. Needs GTID mode, and a primary key (or
+and each table ends with a `snapshot_completed` control event. Needs a primary key (or
 `pk_override`) on every table; tables without one are skipped with a warning. In tests, 1M rows
-took about a minute with 400 writes/s running, and an `ALTER TABLE` during the snapshot took
-0.1 s.
+took about a minute on MySQL with 400 writes/s running, and an `ALTER TABLE` during the
+snapshot took 0.1 s.
 
 **`snapshot_new_tables: true`** snapshots, incrementally, tables that become captured after the
-initial snapshot: tables added to the include lists (found at start-up) and tables renamed into
-a captured database while streaming. Tables created while streaming need no snapshot (all their
-rows come from the binlog), and an online schema-change swap (gh-ost, pt-osc) keeps the table's
-history. With `false`, such tables only get changes from the moment they are captured, and the
-log lists them at every start.
+initial snapshot: tables added to the include lists (or, on PostgreSQL, to the publication),
+found at start-up, and on MySQL tables renamed into a captured database while streaming. Tables
+created while streaming need no snapshot (all their rows come from the stream), and on MySQL an
+online schema-change swap (gh-ost, pt-osc) keeps the table's history. With `false`, such tables
+only get changes from the moment they are captured, and the log lists them at every start.
 
 The offset file records which tables have been snapshotted. Offsets written by earlier versions
 do not have this; on the first start with this version, the tables captured at that moment are
@@ -328,7 +456,7 @@ operator instead:
 
 | Situation | `hold` | `allow` |
 |---|---|---|
-| The binlog was purged past the stored offset (`snapshot_mode: when_needed`): every table must be read again | The source refuses to start until `"resnapshot_approved": true` is set in the offset file (it is used once) | Re-snapshot every table |
+| The change stream can't resume from the stored offset (`snapshot_mode: when_needed`): MySQL's binlog was purged past it, or PostgreSQL's slot was invalidated, dropped, or has already released the WAL after it. Every table must be read again | The source refuses to start until `"resnapshot_approved": true` is set in the offset file (it is used once) | Re-snapshot every table |
 | An offset was recovered without its table-snapshot state (see *Offset recovery*) | The tables are streamed but not snapshotted: listed in `held_tables` of the offset, logged, and announced with a `snapshot_held` control event at every start | Snapshot them as new tables |
 
 To release a held table, send an `execute-snapshot` signal for it (it is snapshotted) or a
@@ -363,7 +491,7 @@ called:
 
 | `type` | `data` | Effect |
 |---|---|---|
-| `execute-snapshot` | `data-collections`; `type` (optional) must be `incremental` | Queue the tables for an incremental snapshot (after any already queued). Releases them if held. Needs GTID mode. |
+| `execute-snapshot` | `data-collections`; `type` (optional) must be `incremental` | Queue the tables for an incremental snapshot (after any already queued). Releases them if held. MySQL needs GTID mode. |
 | `stop-snapshot` | `data-collections` (optional) | Drop the tables (without `data-collections`: every table) from the queue. Rows already emitted stay; the table gets no `snapshot_completed`. |
 | `dismiss-held` | `data-collections` | Treat held tables as snapshotted, without reading them (Vectezium only). |
 | `approve-resnapshot` | — | Approve the full re-snapshot the source is waiting for at start-up (Vectezium only). |
@@ -388,7 +516,7 @@ the signals in `processed/` numbered after its stored `last_signal` again at the
 signal twice does the same as applying it once. (An approval is not applied again: it is only
 good for the start it was given to.)
 
-## Schema changes and other statements
+## Schema changes and other statements (MySQL)
 
 With `include_schema_changes: true`, the `control` output carries `schema_change` events for DDL
 on tables, indexes, views, procedures/functions, triggers, events and databases, plus `TRUNCATE`.
@@ -421,8 +549,12 @@ Other MySQL behaviours to know about:
 * **Partition operations** (`ALTER TABLE … TRUNCATE/DROP/EXCHANGE PARTITION`) remove or swap rows
   without row events. They are logged as a warning and flagged `data_changed: true` on
   the `schema_change` event; re-snapshot the table.
-* **Incomplete row images** (a session set `binlog_row_image` to `MINIMAL` or `NOBLOB`) are
-  failures, like statement-format writes: emitting them would blank out columns downstream.
+* **Incomplete row images:** the source refuses to start unless the server's
+  `binlog_row_image` is `FULL`. A session that sets it to `MINIMAL` or `NOBLOB` anyway produces
+  incomplete images, which are failures, like statement-format writes: emitting them would blank
+  out columns downstream.
+* **`ALTER TABLE … RENAME [TO|AS]`** is classified as a rename, like `RENAME TABLE`, so the
+  table's history follows it.
 * **Tables without a primary key** produce events without a key; the source warns once per
   table. `pk_override` sets the key (or replaces the primary key), like Debezium's
   `message.key.columns`:
@@ -442,6 +574,28 @@ Other MySQL behaviours to know about:
 `JSON` columns are compact JSON text (`json_handling_mode: string`, the default), identical
 whether a row came from the snapshot or the binlog; `json_handling_mode: object` embeds the
 parsed document instead.
+
+## Schema changes and other behaviours (PostgreSQL)
+
+PostgreSQL's logical replication streams no DDL. Before the first change to a table after its
+definition changed, pgoutput sends the table's new description, and with
+`include_schema_changes: true` the source emits a `schema_change` event describing the difference:
+`columns_added`, `columns_removed` and `columns_retyped`. `TRUNCATE` on a captured table is
+always emitted as a `truncate` event, with `cascade` and `restart_identity`. Other statements,
+and logical decoding messages, are not captured.
+
+* **Transactions** are decoded at commit (pgoutput protocol 1): a large transaction arrives in
+  one piece once it commits, and one that rolls back is never sent.
+* **Keys outside the replica identity:** a change to a key column that the replica identity
+  does not cover (with `pk_override`, or `REPLICA IDENTITY USING INDEX` on another index) can't
+  be matched downstream. Such deletes and key changes are failures, subject to
+  `event_processing_failure_handling_mode`; set `REPLICA IDENTITY FULL` on those tables.
+* **Primary-key updates** are emitted as a delete of the old key followed by a create of the new
+  key, as for MySQL.
+* **Partitioned tables** are captured as the partitioned table when the publication has
+  `publish_via_partition_root = true` (see *Slot and publication*).
+* `JSON` and `JSONB` columns follow `json_handling_mode` (text by default), and `INTERVAL`
+  follows `interval_handling_mode`.
 
 ## Table schemas
 
@@ -468,6 +622,9 @@ and `event_format: record` adds `metadata.schema_version` to every row:
 }
 ```
 
+That is a MySQL document. A PostgreSQL one has `postgres_type` in place of `mysql_type`, the
+schema in `db`, and its own position in `first_seen`; the rest is the same.
+
 * `schema_version` is a hash of the column descriptions and the value-encoding settings, so it
   changes on `ALTER TABLE` (or when an encoding option changes) and nowhere else. A snapshot and
   the binlog produce the same version for the same table definition.
@@ -484,15 +641,25 @@ and `event_format: record` adds `metadata.schema_version` to every row:
   `blob_overwrite: true` (see the example config) makes re-emitted documents rewrite their own
   file instead of piling up copies.
 
-## Blob file extension (`azure_blob` sink)
+## `azure_blob` sink options
 
-The patch also adds `blob_extension` to Vector's `azure_blob` sink. By default the extension is
+Vectezium adds three options to Vector's `azure_blob` sink.
+
+**`blob_extension`**: By default the extension is
 derived from `compression` (`.log`, `.log.gz`, …); `blob_extension: json.gz` (or `ndjson`, …)
 overrides it. It only changes the name, not the encoding or compression.
 
-It also adds `blob_overwrite` (default `false`). Normally the sink never replaces an existing
-block blob and fails with `409 Conflict`; with `blob_overwrite: true` it does, which the schema
-sink in the example configs uses so re-emitted schema documents rewrite their own file.
+**`blob_overwrite`** (default `false`): normally the sink never replaces an existing block blob
+and fails with `409 Conflict`; with `blob_overwrite: true` it does, which the schema sink in the
+example configs uses so re-emitted schema documents rewrite their own file.
+
+**`blob_overwrite_order_by`**: a list of JSON fields. Each upload first reads the existing blob
+and skips the write (successfully) if that blob orders after the new one by those fields,
+compared in turn; otherwise it writes only if the blob hasn't changed since it was read (an ETag
+condition), comparing again if it has. Numbers compare as numbers, strings as text, and a
+missing field orders first. Use `["seq", "committed_at"]` for a published-offset blob, so a
+late request never replaces a newer offset. Needs `blob_overwrite: true`, `blob_type: block`,
+`compression: none` and one JSON object per blob (`batch.max_events: 1`).
 
 ## Batching and file sizes
 
@@ -505,12 +672,17 @@ sink in the example configs uses so re-emitted schema documents rewrite their ow
 
 ## Delivery guarantees
 
-* Offsets always point at **transaction boundaries** (after `XID`/`COMMIT`, or after a DDL).
+* Offsets always point at **transaction boundaries** (MySQL: after `XID`/`COMMIT`, or after a
+  DDL; PostgreSQL: after a transaction's `Commit`).
 * With `acknowledgements` enabled, an offset is written only after **every event up to it** was
   acknowledged by the sinks. A crash replays from the last acknowledged transaction:
   **at-least-once**, like Debezium. Replayed changes carry the same `seq` as their first
   delivery; snapshot reads may not. See [Duplicates](#duplicates) for what to deduplicate on.
 * With `publish_offsets`, the published offset marks the delivered, transaction-complete prefix.
+* **PostgreSQL:** the slot is told it may release WAL only up to an offset that is stored (with
+  `publish_offsets`: published and delivered), so a published offset is never behind what the
+  slot still holds. At start, an offset older than the slot's position is treated as lost
+  rather than silently skipped ahead (see *Unplanned snapshots*).
 * If a sink permanently rejects a batch, the source stops advancing offsets and shuts down so the
   data is replayed after a restart rather than skipped.
 * Primary-key updates are emitted as a delete of the old key followed by a create of the new key,
@@ -535,7 +707,7 @@ runs:
 ```
 
 * The lease is taken **before** the stored offset is read. A second instance logs *Another
-  instance holds the single-writer lock* and waits, without connecting to MySQL.
+  instance holds the single-writer lock* and waits, without connecting to the database.
 * The holder renews every third of the lease. On shutdown it waits (up to 10 s) for its last
   acknowledged offset to be stored, then releases the lease, so the next instance starts at
   once and resumes from that offset. A crashed holder blocks a successor until its lease
@@ -579,6 +751,8 @@ checkpoint write errors and delivery failures increment `component_errors_total`
 
 ## Not supported (yet)
 
+**MySQL:**
+
 * MariaDB (different GTID format and binlog events).
 * Debezium's signal table and Kafka signal channels (signals are read from files: see
   *Signals*), and blocking ad-hoc snapshots (`execute-snapshot` with `type: blocking`).
@@ -591,7 +765,20 @@ checkpoint write errors and delivery failures increment `component_errors_total`
 * `snapshot_locking_mode: minimal` needs `FLUSH TABLES WITH READ LOCK`; on managed services that
   forbid it, use `none` and start the snapshot during a quiet period.
 * Incremental snapshots read one table at a time.
-* Character sets other than UTF-8 and latin1 are decoded as UTF-8 (lossy).
+* Character sets other than UTF-8 and latin1 (decoded as cp1252, as MySQL does) are decoded
+  as UTF-8 (lossy).
+
+**PostgreSQL:**
+
+* Streaming transactions before they commit (pgoutput protocol 2 and later), and two-phase
+  transactions.
+* Logical decoding messages (`pg_logical_emit_message`).
+* More than one database per source (a slot belongs to one database).
+* Generated columns, unless the publication publishes them (PostgreSQL 18): pgoutput does not
+  send them, so they are left out of snapshots too.
+
+**Both:**
+
 * Tombstone events and Debezium's Kafka-specific headers are not produced.
 * Vector component reference docs (`website/cue/...`) are not generated yet.
 
@@ -609,6 +796,8 @@ The CDC core shared by every connector (`src/sources/cdc/`):
 | `src/sources/cdc/control.rs`           | Shared control-event payloads (`snapshot_completed`)           |
 | `src/sources/cdc/filter.rs`            | Database, table and column include/exclude lists               |
 | `src/sources/cdc/lock.rs`              | Single-writer lock (Azure blob lease)                          |
+| `src/sources/cdc/recovery.rs`          | Offset recovery from the lake                                  |
+| `src/sources/cdc/signal.rs`            | Signals (the file signal channel)                              |
 | `src/internal_events/cdc.rs`           | Internal events of the shared core                             |
 
 The MySQL connector (`src/sources/mysql_cdc/`):
@@ -628,7 +817,26 @@ The MySQL connector (`src/sources/mysql_cdc/`):
 | `src/sources/mysql_cdc/offset.rs`      | Binlog offsets and GTID sets                                   |
 | `src/internal_events/mysql_cdc.rs`     | MySQL error events and metrics                                 |
 
-Also changed: `src/sinks/azure_blob/` (`blob_extension`, `blob_overwrite`), `Cargo.toml` and
-`Cargo.lock` (the `mysql_async` dependency and the `sources-mysql_cdc` feature).
-`contrib/mysql_cdc/` holds this README, the Docker test environment, the test and benchmark
-scripts and the example configs.
+The PostgreSQL connector (`src/sources/postgres_cdc/`):
+
+| Path                                      | Purpose                                                     |
+|-------------------------------------------|-------------------------------------------------------------|
+| `src/sources/postgres_cdc/mod.rs`         | Configuration and component registration                    |
+| `src/sources/postgres_cdc/source.rs`      | Server checks, slot and publication, start-up decisions     |
+| `src/sources/postgres_cdc/connection.rs`  | Connections, TLS, the replication stream                    |
+| `src/sources/postgres_cdc/stream.rs`      | pgoutput streaming, transactions, status updates, reconnects |
+| `src/sources/postgres_cdc/snapshot.rs`    | Blocking initial snapshot in the slot's exported snapshot   |
+| `src/sources/postgres_cdc/incremental.rs` | Incremental (chunked) snapshots while streaming             |
+| `src/sources/postgres_cdc/catalog.rs`     | Tables, columns, types and publications from the catalog    |
+| `src/sources/postgres_cdc/table_schema.rs`| Table schema documents and schema versions                  |
+| `src/sources/postgres_cdc/convert.rs`     | PostgreSQL value → JSON conversion                          |
+| `src/sources/postgres_cdc/envelope.rs`    | The PostgreSQL `source` block of events                     |
+| `src/sources/postgres_cdc/offset.rs`      | LSNs and stored offsets                                     |
+| `src/internal_events/postgres_cdc.rs`     | PostgreSQL error events and metrics                         |
+
+Also changed: `src/sinks/azure_blob/` (`blob_extension`, `blob_overwrite`,
+`blob_overwrite_order_by`), `Cargo.toml` and `Cargo.lock` (the `mysql_async` and Materialize
+`rust-postgres` dependencies, and the `sources-mysql_cdc` and `sources-postgres_cdc` features),
+`LICENSE-3rdparty.csv`, and `.github/workflows/vectezium.yml` (CI). `contrib/mysql_cdc/` holds
+this README, the Docker test environment, the MySQL test and benchmark scripts and the example
+configs.
